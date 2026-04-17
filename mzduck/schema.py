@@ -1,24 +1,19 @@
 """DuckDB schema contract for mzDuck v1."""
 
+from __future__ import annotations
+
 SCHEMA_VERSION = "1"
 
 SPECTRA_COLUMNS = [
-    "scan_id",
-    "source_index",
-    "native_id",
     "scan_number",
+    "native_id",
     "ms_level",
     "rt",
-    "rt_unit",
     "precursor_mz",
     "precursor_charge",
     "precursor_intensity",
-    "selected_ion_mz",
-    "selected_ion_intensity",
-    "selected_ion_charge",
     "collision_energy",
     "activation_type",
-    "activation_cv",
     "isolation_window_target",
     "isolation_window_lower",
     "isolation_window_upper",
@@ -28,115 +23,108 @@ SPECTRA_COLUMNS = [
     "tic",
     "lowest_mz",
     "highest_mz",
-    "num_peaks",
-    "polarity",
-    "centroided",
     "filter_string",
     "ion_injection_time",
-    "ion_injection_time_unit",
     "monoisotopic_mz",
     "scan_window_lower",
     "scan_window_upper",
+    "mz_array",
+    "intensity_array",
 ]
 
-PEAK_COLUMNS = ["scan_id", "peak_index", "mz", "intensity"]
+PEAK_COLUMNS = ["scan_number", "peak_index", "mz", "intensity"]
 
-CREATE_TABLES_SQL = [
-    """
-    CREATE TABLE spectra (
-        scan_id                    BIGINT PRIMARY KEY,
-        source_index               BIGINT NOT NULL,
-        native_id                  VARCHAR NOT NULL,
-        scan_number                BIGINT,
-        ms_level                   INTEGER NOT NULL,
+SPECTRA_DDL_TEMPLATE = """
+CREATE TABLE spectra (
+    scan_number                INTEGER   NOT NULL,
+    native_id                  VARCHAR,
 
-        rt                         DOUBLE NOT NULL,
-        rt_unit                    VARCHAR NOT NULL,
+    ms_level                   UTINYINT  NOT NULL,
+    rt                         FLOAT     NOT NULL,
 
-        precursor_mz               DOUBLE,
-        precursor_charge           INTEGER,
-        precursor_intensity        DOUBLE,
-        selected_ion_mz            DOUBLE,
-        selected_ion_intensity     DOUBLE,
-        selected_ion_charge        INTEGER,
-        collision_energy           DOUBLE,
-        activation_type            VARCHAR,
-        activation_cv              VARCHAR,
-        isolation_window_target    DOUBLE,
-        isolation_window_lower     DOUBLE,
-        isolation_window_upper     DOUBLE,
-        spectrum_ref               VARCHAR,
+    precursor_mz               DOUBLE,
+    precursor_charge           TINYINT,
+    precursor_intensity        FLOAT,
+    collision_energy           FLOAT,
+    activation_type            VARCHAR,
+    isolation_window_target    DOUBLE,
+    isolation_window_lower     FLOAT,
+    isolation_window_upper     FLOAT,
+    spectrum_ref               VARCHAR,
 
-        base_peak_mz               DOUBLE,
-        base_peak_intensity        DOUBLE,
-        tic                        DOUBLE,
-        lowest_mz                  DOUBLE,
-        highest_mz                 DOUBLE,
-        num_peaks                  BIGINT NOT NULL,
+    base_peak_mz               FLOAT,
+    base_peak_intensity        FLOAT,
+    tic                        FLOAT,
+    lowest_mz                  FLOAT,
+    highest_mz                 FLOAT,
 
-        polarity                   VARCHAR,
-        centroided                 BOOLEAN,
-        filter_string              VARCHAR,
-        ion_injection_time         DOUBLE,
-        ion_injection_time_unit    VARCHAR,
-        monoisotopic_mz            DOUBLE,
-        scan_window_lower          DOUBLE,
-        scan_window_upper          DOUBLE
-    )
-    """,
-    """
-    CREATE TABLE peaks (
-        scan_id      BIGINT NOT NULL,
-        peak_index   BIGINT NOT NULL,
-        mz           DOUBLE NOT NULL,
-        intensity    REAL NOT NULL,
-        PRIMARY KEY (scan_id, peak_index)
-    )
-    """,
-    """
-    CREATE TABLE run_metadata (
-        key      VARCHAR PRIMARY KEY,
-        value    VARCHAR
-    )
-    """,
-]
+    filter_string              VARCHAR,
+    ion_injection_time         FLOAT,
+    monoisotopic_mz            DOUBLE,
+    scan_window_lower          FLOAT,
+    scan_window_upper          FLOAT,
 
-INDEX_SQL = [
-    "CREATE INDEX idx_peaks_scan_id ON peaks(scan_id)",
-    "CREATE INDEX idx_peaks_mz ON peaks(mz)",
-    "CREATE INDEX idx_spectra_rt ON spectra(rt)",
-    "CREATE INDEX idx_spectra_precursor_mz ON spectra(precursor_mz)",
-    "CREATE INDEX idx_spectra_native_id ON spectra(native_id)",
-    "CREATE INDEX idx_spectra_scan_number ON spectra(scan_number)",
-]
-
-VIEW_SQL = """
-CREATE VIEW spectrum_peaks AS
-SELECT
-    s.scan_id,
-    s.native_id,
-    s.rt,
-    s.precursor_mz,
-    s.precursor_charge,
-    p.peak_index,
-    p.mz,
-    p.intensity
-FROM spectra s
-JOIN peaks p ON p.scan_id = s.scan_id
+    mz_array                   {mz_array_type}[] NOT NULL,
+    intensity_array            {intensity_array_type}[] NOT NULL
+)
 """
 
+RUN_METADATA_DDL = """
+CREATE TABLE run_metadata (
+    key      VARCHAR PRIMARY KEY,
+    value    VARCHAR
+)
+"""
 
-def create_schema(conn):
-    """Create the required v1 tables."""
-    for statement in CREATE_TABLES_SQL:
-        conn.execute(statement)
+PEAKS_VIEW_SQL = """
+CREATE VIEW peaks AS
+SELECT
+    scan_number,
+    generate_subscripts(mz_array, 1) - 1 AS peak_index,
+    UNNEST(mz_array)        AS mz,
+    UNNEST(intensity_array) AS intensity
+FROM spectra
+"""
+
+SPECTRUM_PEAKS_VIEW_SQL = """
+CREATE VIEW spectrum_peaks AS
+SELECT
+    scan_number,
+    rt,
+    precursor_mz,
+    precursor_charge,
+    generate_subscripts(mz_array, 1) - 1 AS peak_index,
+    UNNEST(mz_array)        AS mz,
+    UNNEST(intensity_array) AS intensity
+FROM spectra
+"""
+
+INDEX_SCAN_NUMBER_SQL = "CREATE INDEX idx_spectra_scan_number ON spectra(scan_number)"
 
 
-def create_indexes(conn):
-    """Create v1 secondary indexes and the optional convenience view."""
-    for statement in INDEX_SQL:
-        conn.execute(statement)
-    conn.execute(VIEW_SQL)
+def create_schema(conn, *, mz_array_type="FLOAT", intensity_array_type="FLOAT"):
+    """Create the required v1 tables and views."""
+    conn.execute(
+        SPECTRA_DDL_TEMPLATE.format(
+            mz_array_type=normalize_storage_type(mz_array_type),
+            intensity_array_type=normalize_storage_type(intensity_array_type),
+        )
+    )
+    conn.execute(RUN_METADATA_DDL)
+    conn.execute(PEAKS_VIEW_SQL)
+    conn.execute(SPECTRUM_PEAKS_VIEW_SQL)
+
+
+def create_scan_number_index(conn):
+    """Create the optional v1 scan-number index."""
+    conn.execute(INDEX_SCAN_NUMBER_SQL)
+
+
+def normalize_storage_type(value):
+    text = str(value).upper()
+    if text not in {"FLOAT", "DOUBLE"}:
+        raise ValueError(f"Unsupported mzDuck array storage type: {value!r}")
+    return text
 
 
 def get_table_columns(conn, table_name):
@@ -150,7 +138,7 @@ def validate_required_schema(conn):
     missing_tables = {"spectra", "peaks", "run_metadata"} - tables
     if missing_tables:
         missing = ", ".join(sorted(missing_tables))
-        raise ValueError(f"Missing required mzDuck table(s): {missing}")
+        raise ValueError(f"Missing required mzDuck table/view(s): {missing}")
 
     spectra_missing = set(SPECTRA_COLUMNS) - set(get_table_columns(conn, "spectra"))
     peaks_missing = set(PEAK_COLUMNS) - set(get_table_columns(conn, "peaks"))
@@ -177,7 +165,10 @@ def validate_required_schema(conn):
 
 def upsert_metadata(conn, metadata):
     """Insert or replace metadata key/value pairs."""
-    rows = [(str(key), None if value is None else str(value)) for key, value in metadata.items()]
+    rows = [
+        (str(key), None if value is None else str(value))
+        for key, value in metadata.items()
+    ]
     if not rows:
         return
     conn.executemany(

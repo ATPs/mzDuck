@@ -65,7 +65,8 @@ mzduck convert \
   mzduck/example_data/tiny.mzML \
   -o /tmp/tiny.mzduck \
   --overwrite \
-  --no-sha256
+  --no-sha256 \
+  --compression zstd
 ```
 
 Inspect the mzDuck file:
@@ -92,7 +93,7 @@ Control mzML binary array precision:
 # Both arrays as 32-bit floats.
 mzduck export-mzml /tmp/tiny.mzduck -o /tmp/tiny.32.mzML --32 --overwrite
 
-# Keep the default: m/z 64-bit, intensity 32-bit.
+# Per-array control.
 mzduck export-mzml /tmp/tiny.mzduck -o /tmp/tiny.mz64-int32.mzML --mz64 --inten32 --overwrite
 
 # Mixed precision is allowed.
@@ -119,14 +120,14 @@ db = MzDuckFile.from_mzml(
 try:
     print(db.inspect())
 
-    spectrum = db.get_spectrum(0)
+    spectrum = db.get_spectrum(1)
     print(spectrum["native_id"])
     print(spectrum["mz"])
     print(spectrum["intensity"])
 
     rows = db.query(
         """
-        SELECT native_id, rt, precursor_mz, precursor_charge
+        SELECT scan_number, rt, precursor_mz, precursor_charge
         FROM spectra
         WHERE precursor_mz BETWEEN ? AND ?
         ORDER BY rt
@@ -147,7 +148,7 @@ Open an existing file read-only:
 from mzduck import MzDuckFile, example_data_path
 
 with MzDuckFile.open(example_data_path("tiny.mzduck")) as db:
-    print(db.get_spectrum(0))
+    print(db.get_spectrum(1))
 ```
 
 ## SQL Examples
@@ -155,7 +156,7 @@ with MzDuckFile.open(example_data_path("tiny.mzduck")) as db:
 Find precursor spectra in a mass window:
 
 ```sql
-SELECT native_id, rt, precursor_mz, precursor_charge
+SELECT scan_number, rt, precursor_mz, precursor_charge
 FROM spectra
 WHERE precursor_mz BETWEEN 440.0 AND 450.0
 ORDER BY rt;
@@ -166,7 +167,7 @@ Get peaks for one spectrum in source order:
 ```sql
 SELECT mz, intensity
 FROM peaks
-WHERE scan_id = 0
+WHERE scan_number = 1
 ORDER BY peak_index;
 ```
 
@@ -175,7 +176,7 @@ Extract a product-ion chromatogram:
 ```sql
 SELECT s.rt, SUM(p.intensity) AS xic
 FROM spectra s
-JOIN peaks p ON p.scan_id = s.scan_id
+JOIN peaks p ON p.scan_number = s.scan_number
 WHERE p.mz BETWEEN 149.0 AND 151.0
 GROUP BY s.rt
 ORDER BY s.rt;
@@ -197,18 +198,20 @@ Run a full conversion/export workflow:
 
 ## Schema Summary
 
-The v1 database has three required tables:
+The v1 database has two required tables and one required compatibility view:
 
 - `spectra`: one row per imported MS2 spectrum with retention time, precursor
   metadata, scan metadata, activation type, scan windows, TIC, base peak, and
-  source identifiers.
-- `peaks`: one row per peak with `scan_id`, `peak_index`, `mz`, and
-  `intensity`. `peak_index` preserves source array order.
+  source identifiers. Peak data is stored as per-spectrum `mz_array` and
+  `intensity_array` list columns.
+- `peaks`: a view exposing `scan_number`, `peak_index`, `mz`, and `intensity`
+  for familiar peak-level SQL. `peak_index` preserves source array order.
 - `run_metadata`: schema version, provenance, source metadata, counts, dtypes,
   and mzML header snapshots.
 
-The schema also creates indexes for spectrum lookup, precursor m/z search,
-fragment m/z search, retention-time windows, native ids, and scan numbers.
+The schema creates no secondary indexes by default. Use
+`mzduck convert --index-scan-number` when repeated exact scan-number lookups need
+an ART index.
 
 See `design/20260416design.codex.md` for the complete v1 specification.
 

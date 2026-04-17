@@ -18,8 +18,8 @@ def main() -> None:
         print("Summary")
         print(db.inspect())
 
-        print("\nSpectrum 0")
-        spectrum = db.get_spectrum(0)
+        print("\nSpectrum 1")
+        spectrum = db.get_spectrum(1)
         print("native_id:", spectrum["native_id"])
         print("precursor_mz:", spectrum["precursor_mz"])
         print("mz:", spectrum["mz"].tolist())
@@ -28,7 +28,7 @@ def main() -> None:
         print("\nPrecursor query")
         rows = db.query(
             """
-            SELECT native_id, rt, precursor_mz, precursor_charge
+            SELECT scan_number, rt, precursor_mz, precursor_charge
             FROM spectra
             WHERE precursor_mz BETWEEN ? AND ?
             ORDER BY rt
@@ -43,7 +43,7 @@ def main() -> None:
             """
             SELECT s.rt, SUM(p.intensity) AS xic
             FROM spectra s
-            JOIN peaks p ON p.scan_id = s.scan_id
+            JOIN peaks p ON p.scan_number = s.scan_number
             WHERE p.mz BETWEEN ? AND ?
             GROUP BY s.rt
             ORDER BY s.rt

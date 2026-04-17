@@ -45,8 +45,8 @@ mzML precision flags for export-mzml:
   --inten64  write only intensity arrays as 64-bit floats
 
 Defaults:
-  mzDuck stores peak m/z as DOUBLE and intensity as REAL.
-  mzML export defaults to --mz64 --inten32.
+  mzDuck stores peak arrays in the source dtype where possible.
+  mzML export defaults to the stored/source dtype unless precision flags are used.
 """
 
 
@@ -76,6 +76,23 @@ Examples:
     convert.add_argument("--overwrite", action="store_true", help="replace an existing output file")
     convert.add_argument("--batch-size", type=int, default=5000, help="number of spectra per insert batch")
     convert.add_argument("--no-sha256", action="store_true", help="skip source file SHA-256 hashing")
+    convert.add_argument(
+        "--compression",
+        choices=["zstd", "auto", "uncompressed"],
+        default="zstd",
+        help="force DuckDB column compression before writing",
+    )
+    convert.add_argument(
+        "--compression-level",
+        type=int,
+        default=6,
+        help="requested zstd compression level, recorded if DuckDB ignores it",
+    )
+    convert.add_argument(
+        "--index-scan-number",
+        action="store_true",
+        help="create the optional scan_number index after import",
+    )
 
     export_mgf = subparsers.add_parser(
         "export-mgf",
@@ -157,8 +174,8 @@ def resolve_precision(args, parser):
     if args.inten32 and args.inten64:
         parser.error("--inten32 and --inten64 cannot be used together")
 
-    mz_precision = 64
-    intensity_precision = 32
+    mz_precision = None
+    intensity_precision = None
     if args.precision32:
         mz_precision = 32
         intensity_precision = 32
@@ -187,6 +204,9 @@ def main(argv=None):
                 output,
                 overwrite=args.overwrite,
                 batch_size=args.batch_size,
+                compression=args.compression,
+                compression_level=args.compression_level,
+                index_scan_number=args.index_scan_number,
                 compute_sha256=not args.no_sha256,
             )
             handle.close()

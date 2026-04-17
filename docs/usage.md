@@ -32,7 +32,8 @@ mzduck convert \
   mzduck/example_data/tiny.mzML \
   -o /tmp/tiny.mzduck \
   --overwrite \
-  --no-sha256
+  --no-sha256 \
+  --compression zstd
 ```
 
 Commands that write files accept either a positional output path or `-o/--out`:
@@ -84,7 +85,7 @@ mzduck export-mzml /tmp/tiny.mzduck -o /tmp/tiny.32.mzML --32 --overwrite
 # Both arrays as 64-bit floats.
 mzduck export-mzml /tmp/tiny.mzduck -o /tmp/tiny.64.mzML --64 --overwrite
 
-# Per-array control. This is also the default.
+# Per-array control.
 mzduck export-mzml /tmp/tiny.mzduck -o /tmp/tiny.mz64-int32.mzML --mz64 --inten32 --overwrite
 
 # Mixed precision in the other direction.
@@ -99,14 +100,14 @@ from mzduck import MzDuckFile, example_data_path
 with MzDuckFile.open(example_data_path("tiny.mzduck")) as db:
     print(db.inspect())
 
-    spectrum = db.get_spectrum(0)
+    spectrum = db.get_spectrum(1)
     print(spectrum["native_id"])
     print(spectrum["mz"])
     print(spectrum["intensity"])
 
     rows = db.query(
         """
-        SELECT native_id, rt, precursor_mz, precursor_charge
+        SELECT scan_number, rt, precursor_mz, precursor_charge
         FROM spectra
         WHERE precursor_mz BETWEEN ? AND ?
         """,
@@ -120,7 +121,7 @@ with MzDuckFile.open(example_data_path("tiny.mzduck")) as db:
 Find precursor spectra in a mass window:
 
 ```sql
-SELECT native_id, rt, precursor_mz, precursor_charge
+SELECT scan_number, rt, precursor_mz, precursor_charge
 FROM spectra
 WHERE precursor_mz BETWEEN 440.0 AND 450.0
 ORDER BY rt;
@@ -131,7 +132,7 @@ Get the peaks for one spectrum in source order:
 ```sql
 SELECT mz, intensity
 FROM peaks
-WHERE scan_id = 0
+WHERE scan_number = 1
 ORDER BY peak_index;
 ```
 
@@ -140,7 +141,7 @@ Extract a product-ion chromatogram:
 ```sql
 SELECT s.rt, SUM(p.intensity) AS xic
 FROM spectra s
-JOIN peaks p ON p.scan_id = s.scan_id
+JOIN peaks p ON p.scan_number = s.scan_number
 WHERE p.mz BETWEEN 149.0 AND 151.0
 GROUP BY s.rt
 ORDER BY s.rt;

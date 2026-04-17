@@ -23,7 +23,7 @@ def test_bundled_example_data_files_are_readable():
         summary = db.inspect()
         assert summary["spectrum_count"] == 2
         assert summary["peak_count"] == 5
-        assert db.get_spectrum(0)["native_id"].endswith("scan=1")
+        assert db.get_spectrum(1)["native_id"].endswith("scan=1")
 
     with mgf.read(str(mgf_path)) as reader:
         spectra = list(reader)

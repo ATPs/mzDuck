@@ -29,6 +29,9 @@ class MzDuckFile:
         *,
         overwrite=False,
         batch_size=5000,
+        compression="zstd",
+        compression_level=6,
+        index_scan_number=False,
         compute_sha256=True,
     ) -> "MzDuckFile":
         output = convert_mzml_to_mzduck(
@@ -36,6 +39,9 @@ class MzDuckFile:
             output_path,
             overwrite=overwrite,
             batch_size=batch_size,
+            compression=compression,
+            compression_level=compression_level,
+            index_scan_number=index_scan_number,
             compute_sha256=compute_sha256,
         )
         return cls.open(output, read_only=False)
@@ -62,8 +68,8 @@ class MzDuckFile:
         output_path,
         *,
         overwrite=False,
-        mz_precision=64,
-        intensity_precision=32,
+        mz_precision=None,
+        intensity_precision=None,
     ):
         """Export to mzML format using psims."""
         return export_mzml(
@@ -74,29 +80,30 @@ class MzDuckFile:
             intensity_precision=intensity_precision,
         )
 
-    def get_spectrum(self, scan_id) -> dict:
-        """Get a single spectrum by scan ID."""
+    def get_spectrum(self, scan_number) -> dict:
+        """Get a single spectrum by mzML scan number."""
         cursor = self.conn.execute(
-            "SELECT * FROM spectra WHERE scan_id = ?",
-            [scan_id],
+            "SELECT * FROM spectra WHERE scan_number = ?",
+            [scan_number],
         )
         row = cursor.fetchone()
         if row is None:
-            raise KeyError(f"No spectrum with scan_id={scan_id}")
+            raise KeyError(f"No spectrum with scan_number={scan_number}")
         columns = [item[0] for item in cursor.description]
         result = dict(zip(columns, row))
-        peak_rows = self.conn.execute(
-            """
-            SELECT mz, intensity
-            FROM peaks
-            WHERE scan_id = ?
-            ORDER BY peak_index
-            """,
-            [scan_id],
-        ).fetchall()
-        result["mz"] = np.asarray([peak[0] for peak in peak_rows], dtype=np.float64)
+        meta = self.metadata()
+        result["native_id"] = reconstruct_native_id(result, meta)
+        result["rt_unit"] = meta.get("rt_unit")
+        result["polarity"] = meta.get("polarity") or None
+        result["centroided"] = str(meta.get("centroided", "")).lower() == "true"
+        result["ion_injection_time_unit"] = meta.get("ion_injection_time_unit")
+        result["mz"] = np.asarray(
+            result["mz_array"],
+            dtype=numpy_dtype_for_storage(meta.get("mz_array_storage_dtype")),
+        )
         result["intensity"] = np.asarray(
-            [peak[1] for peak in peak_rows], dtype=np.float32
+            result["intensity_array"],
+            dtype=numpy_dtype_for_storage(meta.get("intensity_array_storage_dtype")),
         )
         return result
 
@@ -116,7 +123,9 @@ class MzDuckFile:
             """
             SELECT
                 COUNT(*) AS spectrum_count,
-                COALESCE(SUM(num_peaks), 0) AS peak_count,
+                COALESCE(SUM(len(mz_array)), 0) AS peak_count,
+                MIN(scan_number) AS scan_number_min,
+                MAX(scan_number) AS scan_number_max,
                 MIN(rt) AS rt_min,
                 MAX(rt) AS rt_max,
                 MIN(precursor_mz) AS precursor_mz_min,
@@ -144,16 +153,38 @@ class MzDuckFile:
                 """
             ).fetchall()
         )
+        scan_min = row[2]
+        scan_max = row[3]
+        spectrum_count = int(row[0])
+        scan_numbers_contiguous = (
+            scan_min is not None
+            and scan_max is not None
+            and scan_max - scan_min + 1 == spectrum_count
+        )
         return {
             "schema_version": meta.get("schema_version"),
             "source_filename": meta.get("source_filename"),
             "run_id": meta.get("run_id"),
-            "spectrum_count": int(row[0]),
+            "spectrum_count": spectrum_count,
             "peak_count": int(row[1]),
-            "rt_range": [row[2], row[3]],
-            "precursor_mz_range": [row[4], row[5]],
+            "scan_number_range": [scan_min, scan_max],
+            "scan_numbers_contiguous": scan_numbers_contiguous,
+            "rt_range": [row[4], row[5]],
+            "precursor_mz_range": [row[6], row[7]],
             "charge_distribution": charge_distribution,
             "activation_type_distribution": activation_distribution,
+            "rt_unit": meta.get("rt_unit"),
+            "polarity": meta.get("polarity"),
+            "centroided": meta.get("centroided"),
+            "ion_injection_time_unit": meta.get("ion_injection_time_unit"),
+            "native_id_template": meta.get("native_id_template"),
+            "compression": meta.get("compression"),
+            "compression_level": meta.get("compression_level"),
+            "index_scan_number": meta.get("index_scan_number"),
+            "mz_array_storage_dtype": meta.get("mz_array_storage_dtype"),
+            "intensity_array_storage_dtype": meta.get(
+                "intensity_array_storage_dtype"
+            ),
             "file_size": self.path.stat().st_size,
         }
 
@@ -167,3 +198,21 @@ class MzDuckFile:
     def __exit__(self, exc_type, exc, tb):
         self.close()
         return False
+
+
+def reconstruct_native_id(row, metadata):
+    native_id = row.get("native_id")
+    if native_id:
+        return native_id
+    template = metadata.get("native_id_template")
+    if template:
+        return template.format(scan_number=row["scan_number"])
+    return f"scan={row['scan_number']}"
+
+
+def numpy_dtype_for_storage(storage_dtype):
+    if storage_dtype == "FLOAT":
+        return np.float32
+    if storage_dtype == "DOUBLE":
+        return np.float64
+    return None

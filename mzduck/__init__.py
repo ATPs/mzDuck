@@ -6,13 +6,27 @@ from .file import MzDuckFile
 from .examples import example_data_path
 
 
-def from_mzml(mzml_path, output_path, *, overwrite=False, batch_size=5000):
+def from_mzml(
+    mzml_path,
+    output_path,
+    *,
+    overwrite=False,
+    batch_size=5000,
+    compression="zstd",
+    compression_level=6,
+    index_scan_number=False,
+    compute_sha256=True,
+):
     """Convert one mzML file into one mzDuck file."""
     return MzDuckFile.from_mzml(
         mzml_path,
         output_path,
         overwrite=overwrite,
         batch_size=batch_size,
+        compression=compression,
+        compression_level=compression_level,
+        index_scan_number=index_scan_number,
+        compute_sha256=compute_sha256,
     )
 
 
@@ -30,7 +44,7 @@ def to_mgf(mzduck_path, output_path):
         handle.close()
 
 
-def to_mzml(mzduck_path, output_path, *, mz_precision=64, intensity_precision=32):
+def to_mzml(mzduck_path, output_path, *, mz_precision=None, intensity_precision=None):
     """Export an mzDuck file to mzML."""
     handle = MzDuckFile.open(mzduck_path, read_only=True)
     try:

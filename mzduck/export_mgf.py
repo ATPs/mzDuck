@@ -33,33 +33,43 @@ def ensure_output_path(output_path, *, overwrite=False):
 
 def export_mgf(conn, output_path, *, overwrite=False):
     path = ensure_output_path(output_path, overwrite=overwrite)
-    spectra = conn.execute(
+    metadata = dict(conn.execute("SELECT key, value FROM run_metadata").fetchall())
+    rt_unit = metadata.get("rt_unit")
+    native_id_template = metadata.get("native_id_template")
+    cursor = conn.execute(
         """
         SELECT
-            scan_id,
+            scan_number,
             native_id,
             rt,
-            rt_unit,
-            precursor_mz,
-            precursor_charge,
-            precursor_intensity
-        FROM spectra
-        ORDER BY scan_id
-        """
-    ).fetchall()
-
-    with path.open("w", encoding="utf-8", newline="\n") as handle:
-        for (
-            scan_id,
-            native_id,
-            rt,
-            rt_unit,
             precursor_mz,
             precursor_charge,
             precursor_intensity,
-        ) in spectra:
+            mz_array,
+            intensity_array
+        FROM spectra
+        ORDER BY scan_number
+        """
+    )
+
+    with path.open("w", encoding="utf-8", newline="\n") as handle:
+        while True:
+            row = cursor.fetchone()
+            if row is None:
+                break
+            (
+                scan_number,
+                native_id,
+                rt,
+                precursor_mz,
+                precursor_charge,
+                precursor_intensity,
+                mz_array,
+                intensity_array,
+            ) = row
             handle.write("BEGIN IONS\n")
-            handle.write(f"TITLE={native_id}\n")
+            title = reconstruct_native_id(native_id, native_id_template, scan_number)
+            handle.write(f"TITLE={title}\n")
             if precursor_mz is not None:
                 pepmass = format_float(precursor_mz)
                 if precursor_intensity is not None:
@@ -72,16 +82,15 @@ def export_mgf(conn, output_path, *, overwrite=False):
             seconds = rt_to_seconds(rt, rt_unit)
             if seconds is not None:
                 handle.write(f"RTINSECONDS={format_float(seconds)}\n")
-            peaks = conn.execute(
-                """
-                SELECT mz, intensity
-                FROM peaks
-                WHERE scan_id = ?
-                ORDER BY peak_index
-                """,
-                [scan_id],
-            ).fetchall()
-            for mz, intensity in peaks:
+            for mz, intensity in zip(mz_array, intensity_array):
                 handle.write(f"{format_float(mz)} {format_float(intensity)}\n")
             handle.write("END IONS\n\n")
     return path
+
+
+def reconstruct_native_id(native_id, native_id_template, scan_number):
+    if native_id:
+        return native_id
+    if native_id_template:
+        return native_id_template.format(scan_number=scan_number)
+    return f"scan={scan_number}"

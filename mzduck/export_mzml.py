@@ -35,8 +35,8 @@ def export_mzml(
     output_path,
     *,
     overwrite=False,
-    mz_precision=64,
-    intensity_precision=32,
+    mz_precision=None,
+    intensity_precision=None,
 ):
     try:
         from psims.mzml import MzMLWriter
@@ -45,9 +45,15 @@ def export_mzml(
         raise RuntimeError("psims is required for mzML export") from exc
 
     path = ensure_output_path(output_path, overwrite=overwrite)
-    mz_dtype = dtype_for_precision(mz_precision, "m/z")
-    intensity_dtype = dtype_for_precision(intensity_precision, "intensity")
     metadata = dict(conn.execute("SELECT key, value FROM run_metadata").fetchall())
+    mz_dtype = dtype_for_precision(
+        mz_precision, "m/z", metadata.get("mz_array_storage_dtype")
+    )
+    intensity_dtype = dtype_for_precision(
+        intensity_precision,
+        "intensity",
+        metadata.get("intensity_array_storage_dtype"),
+    )
     run_id = metadata.get("run_id") or "mzduck_run"
     count = conn.execute("SELECT COUNT(*) FROM spectra").fetchone()[0]
 
@@ -101,26 +107,20 @@ def export_mzml(
                 )
                 with writer.run(id=run_id):
                     with writer.spectrum_list(count=count):
-                        spectra = conn.execute(
-                            "SELECT * FROM spectra ORDER BY scan_id"
-                        ).fetchall()
+                        cursor = conn.execute(
+                            "SELECT * FROM spectra ORDER BY scan_number"
+                        )
                         columns = [item[0] for item in conn.description]
-                        for row in spectra:
+                        while True:
+                            row = cursor.fetchone()
+                            if row is None:
+                                break
                             spectrum = dict(zip(columns, row))
-                            peaks = conn.execute(
-                                """
-                                SELECT mz, intensity
-                                FROM peaks
-                                WHERE scan_id = ?
-                                ORDER BY peak_index
-                                """,
-                                [spectrum["scan_id"]],
-                            ).fetchall()
                             mz_array = np.asarray(
-                                [peak[0] for peak in peaks], dtype=mz_dtype
+                                spectrum["mz_array"], dtype=mz_dtype
                             )
                             intensity_array = np.asarray(
-                                [peak[1] for peak in peaks], dtype=intensity_dtype
+                                spectrum["intensity_array"], dtype=intensity_dtype
                             )
                             writer.write_spectrum(
                                 mz_array=mz_array,
@@ -129,23 +129,29 @@ def export_mzml(
                                     "m/z array": mz_dtype,
                                     "intensity array": intensity_dtype,
                                 },
-                                id=spectrum["native_id"],
-                                polarity=polarity_param(spectrum.get("polarity")),
-                                centroided=bool_or_default(
-                                    spectrum.get("centroided"), True
+                                id=reconstruct_native_id(spectrum, metadata),
+                                polarity=polarity_param(metadata.get("polarity")),
+                                centroided=metadata_bool(
+                                    metadata.get("centroided"), True
                                 ),
                                 precursor_information=precursor_information(spectrum),
                                 scan_start_time=rt_to_minutes(
-                                    spectrum.get("rt"), spectrum.get("rt_unit")
+                                    spectrum.get("rt"), metadata.get("rt_unit")
                                 ),
                                 params=spectrum_params(spectrum),
-                                scan_params=scan_params(spectrum),
+                                scan_params=scan_params(spectrum, metadata),
                                 scan_window_list=scan_window_list(spectrum),
                             )
     return path
 
 
-def dtype_for_precision(precision, label):
+def dtype_for_precision(precision, label, storage_dtype):
+    if precision is None:
+        if storage_dtype == "FLOAT":
+            return np.float32
+        if storage_dtype == "DOUBLE":
+            return np.float64
+        raise ValueError(f"Unknown stored {label} dtype: {storage_dtype!r}")
     value = int(precision)
     if value == 32:
         return np.float32
@@ -154,10 +160,20 @@ def dtype_for_precision(precision, label):
     raise ValueError(f"{label} precision must be 32 or 64, got {precision!r}")
 
 
-def bool_or_default(value, default):
+def metadata_bool(value, default):
     if value is None:
         return default
-    return bool(value)
+    return str(value).lower() == "true"
+
+
+def reconstruct_native_id(spectrum, metadata):
+    native_id = spectrum.get("native_id")
+    if native_id:
+        return native_id
+    template = metadata.get("native_id_template")
+    if template:
+        return template.format(scan_number=spectrum["scan_number"])
+    return f"scan={spectrum['scan_number']}"
 
 
 def polarity_param(value):
@@ -189,7 +205,7 @@ def spectrum_params(spectrum):
     return params
 
 
-def scan_params(spectrum):
+def scan_params(spectrum, metadata):
     params = []
     if spectrum.get("filter_string"):
         params.append({"filter string": spectrum["filter_string"]})
@@ -198,7 +214,7 @@ def scan_params(spectrum):
             {
                 "name": "ion injection time",
                 "value": spectrum["ion_injection_time"],
-                "unitName": spectrum.get("ion_injection_time_unit") or "millisecond",
+                "unitName": metadata.get("ion_injection_time_unit") or "millisecond",
             }
         )
     if spectrum.get("monoisotopic_mz") is not None:
