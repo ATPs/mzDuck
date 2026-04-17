@@ -23,9 +23,16 @@ from .metadata import (
     provenance_metadata,
 )
 from .schema import (
-    SPECTRA_COLUMNS,
-    create_scan_number_index,
+    MGF_COLUMNS,
+    MS1_COLUMNS,
+    MS2_COLUMNS,
+    MSN_COLUMNS,
+    SPECTRUM_SUMMARY_COLUMNS,
+    create_scan_index,
     create_schema,
+    metadata_json,
+    msn_table_name,
+    table_exists,
     upsert_metadata,
 )
 
@@ -48,9 +55,14 @@ NON_ACTIVATION_KEYS = {
 
 SCALAR_ARROW_TYPES = {
     "scan_number": pa.int32(),
+    "source_index": pa.int32(),
     "native_id": pa.string(),
     "ms_level": pa.uint8(),
+    "table_name": pa.string(),
+    "title": pa.string(),
     "rt": pa.float32(),
+    "peak_count": pa.int32(),
+    "included_in_mgf": pa.bool_(),
     "precursor_mz": pa.float64(),
     "precursor_charge": pa.int8(),
     "precursor_intensity": pa.float32(),
@@ -81,10 +93,17 @@ def convert_mzml_to_mzduck(
     batch_size=5000,
     compression="zstd",
     compression_level=6,
+    index_scan=False,
     index_scan_number=False,
     compute_sha256=True,
+    ms2_mgf_only=False,
+    no_ms1=False,
+    ms2_only=False,
+    ms1_only=False,
+    start_scan=None,
+    end_scan=None,
 ):
-    """Convert a centroid MS2 mzML file into a v1 mzDuck database."""
+    """Convert one mzML run into an mzDuck database."""
     source = Path(mzml_path)
     output = Path(output_path)
     validate_input_paths(source, output, overwrite=overwrite)
@@ -92,15 +111,41 @@ def convert_mzml_to_mzduck(
         raise ValueError("batch_size must be >= 1")
     compression = validate_compression(compression)
     compression_level = validate_compression_level(compression_level)
+    options = resolve_import_options(
+        ms2_mgf_only=ms2_mgf_only,
+        no_ms1=no_ms1,
+        ms2_only=ms2_only,
+        ms1_only=ms1_only,
+        start_scan=start_scan,
+        end_scan=end_scan,
+    )
+    index_scan = bool(index_scan or index_scan_number)
 
-    pre_scan = pre_scan_mzml(source)
+    pre_scan = pre_scan_mzml(source, options)
     warnings = list(pre_scan["warnings"])
+
+    include_mgf = pre_scan["included_counts"].get(2, 0) > 0 and options["include_mgf"]
+    include_ms1 = pre_scan["included_counts"].get(1, 0) > 0 and options["include_ms1"]
+    include_ms2 = (
+        pre_scan["included_counts"].get(2, 0) > 0 and options["include_ms2_detail"]
+    )
+    msn_levels = [
+        level
+        for level, count in pre_scan["included_counts"].items()
+        if level >= 3 and count > 0 and options["include_msn_detail"]
+    ]
+    include_summary = not options["ms2_mgf_only"]
 
     conn = duckdb.connect(str(output))
     try:
         warnings.extend(apply_compression(conn, compression, compression_level))
         create_schema(
             conn,
+            include_mgf=include_mgf,
+            include_ms1=include_ms1,
+            include_ms2=include_ms2,
+            msn_levels=msn_levels,
+            include_summary=include_summary,
             mz_array_type=pre_scan["mz_array_storage_dtype"],
             intensity_array_type=pre_scan["intensity_array_storage_dtype"],
         )
@@ -114,11 +159,15 @@ def convert_mzml_to_mzduck(
         metadata.update(extract_header_metadata(source))
         metadata.update(
             {
+                "import_mode": options["mode"],
+                "no_ms1": "true" if options["no_ms1"] else "false",
+                "start_scan": "" if options["start_scan"] is None else str(options["start_scan"]),
+                "end_scan": "" if options["end_scan"] is None else str(options["end_scan"]),
                 "rt_unit": pre_scan["rt_unit"],
                 "polarity": pre_scan["polarity"],
                 "centroided": "true" if pre_scan["centroided"] else "false",
                 "ion_injection_time_unit": pre_scan["ion_injection_time_unit"],
-                "native_id_template": pre_scan["native_id_template"],
+                "native_id_template": pre_scan["native_id_template"] or "",
                 "mz_array_dtype": ",".join(pre_scan["mz_array_dtypes"]),
                 "intensity_array_dtype": ",".join(pre_scan["intensity_array_dtypes"]),
                 "mz_array_storage_dtype": pre_scan["mz_array_storage_dtype"],
@@ -127,60 +176,118 @@ def convert_mzml_to_mzduck(
                 ],
                 "compression": compression,
                 "compression_level": str(compression_level),
-                "index_scan_number": "true" if index_scan_number else "false",
+                "index_scan": "true" if index_scan else "false",
+                "index_scan_number": "true" if index_scan else "false",
+                "mgf_title_source": output.stem,
+                "mgf_title_template": (
+                    "{mgf_title_source}.{scan_number}.{scan_number}."
+                    "{precursor_charge}"
+                ),
+                "source_ms_level_counts": metadata_json(pre_scan["source_counts"]),
+                "source_ms_level_peak_counts": metadata_json(
+                    pre_scan["source_peak_counts"]
+                ),
+                "included_ms_level_counts": metadata_json(
+                    pre_scan["included_counts"]
+                ),
+                "included_ms_level_peak_counts": metadata_json(
+                    pre_scan["included_peak_counts"]
+                ),
             }
         )
         upsert_metadata(conn, metadata)
 
-        rows: list[dict] = []
-        mz_arrays: list[np.ndarray] = []
-        intensity_arrays: list[np.ndarray] = []
-        spectrum_count = 0
-        peak_count = 0
+        batches = build_batches(
+            conn=conn,
+            include_mgf=include_mgf,
+            include_ms1=include_ms1,
+            include_ms2=include_ms2,
+            msn_levels=msn_levels,
+            include_summary=include_summary,
+            batch_size=batch_size,
+            mz_storage_type=pre_scan["mz_array_storage_dtype"],
+            intensity_storage_type=pre_scan["intensity_array_storage_dtype"],
+        )
+        inserted_counts = Counter()
+        inserted_peak_counts = Counter()
 
         with mzml.MzML(str(source)) as reader:
-            for source_order, spectrum in enumerate(reader):
-                row, mz_array, intensity_array, row_warnings = spectrum_to_row(
+            for source_index, spectrum in enumerate(reader):
+                native_id = str(spectrum.get("id") or "")
+                scan_number = resolve_scan_number(spectrum, native_id, source_index)
+                ms_level = as_int(spectrum.get("ms level"))
+                if not include_spectrum(ms_level, scan_number, options):
+                    continue
+
+                record, mz_array, intensity_array, row_warnings = spectrum_to_record(
                     spectrum,
-                    source_order=source_order,
+                    source_index=source_index,
                     constants=pre_scan,
                 )
                 warnings.extend(row_warnings)
-                rows.append(row)
-                mz_arrays.append(mz_array)
-                intensity_arrays.append(intensity_array)
-                spectrum_count += 1
-                peak_count += len(mz_array)
-                if len(rows) >= batch_size:
-                    flush_batches(
-                        conn,
-                        rows,
-                        mz_arrays,
-                        intensity_arrays,
-                        pre_scan["mz_array_storage_dtype"],
-                        pre_scan["intensity_array_storage_dtype"],
+                inserted_counts[ms_level] += 1
+                inserted_peak_counts[ms_level] += len(mz_array)
+
+                if ms_level == 1:
+                    table_name = "ms1_spectra"
+                    if include_ms1:
+                        batches[table_name].append(
+                            ms1_row(record, mz_array, intensity_array)
+                        )
+                elif ms_level == 2:
+                    table_name = "mgf"
+                    if include_mgf:
+                        batches["mgf"].append(
+                            mgf_row(
+                                record,
+                                mz_array,
+                                intensity_array,
+                                title_source=output.stem,
+                            )
+                        )
+                    if include_ms2:
+                        batches["ms2_spectra"].append(ms2_row(record))
+                else:
+                    table_name = msn_table_name(ms_level)
+                    if table_name in batches:
+                        batches[table_name].append(
+                            msn_row(record, mz_array, intensity_array)
+                        )
+
+                if include_summary:
+                    summary_table = table_name if ms_level != 2 or not include_ms2 else "ms2_spectra"
+                    batches["spectrum_summary"].append(
+                        summary_row(
+                            record,
+                            table_name=summary_table,
+                            peak_count=len(mz_array),
+                            included_in_mgf=(ms_level == 2 and include_mgf),
+                        )
                     )
 
-        flush_batches(
-            conn,
-            rows,
-            mz_arrays,
-            intensity_arrays,
-            pre_scan["mz_array_storage_dtype"],
-            pre_scan["intensity_array_storage_dtype"],
-        )
+        for batch in batches.values():
+            batch.flush()
 
-        upsert_metadata(
+        validate_import(
             conn,
-            {
-                "spectrum_count": str(spectrum_count),
-                "peak_count": str(peak_count),
-                "conversion_warnings": json.dumps(warnings, sort_keys=True),
-            },
+            expected_counts=inserted_counts,
+            expected_peak_counts=inserted_peak_counts,
+            include_mgf=include_mgf,
+            include_ms1=include_ms1,
+            include_ms2=include_ms2,
+            msn_levels=msn_levels,
+            include_summary=include_summary,
         )
-        if index_scan_number:
-            create_scan_number_index(conn)
-        validate_import(conn, spectrum_count, peak_count)
+        if index_scan:
+            create_scan_index(conn)
+
+        summary_metadata = build_summary_metadata(
+            conn,
+            inserted_counts=inserted_counts,
+            inserted_peak_counts=inserted_peak_counts,
+            warnings=warnings,
+        )
+        upsert_metadata(conn, summary_metadata)
         conn.execute("CHECKPOINT")
     except Exception:
         conn.close()
@@ -190,6 +297,60 @@ def convert_mzml_to_mzduck(
     else:
         conn.close()
     return output
+
+
+def resolve_import_options(
+    *,
+    ms2_mgf_only=False,
+    no_ms1=False,
+    ms2_only=False,
+    ms1_only=False,
+    start_scan=None,
+    end_scan=None,
+):
+    mode_flags = [bool(ms2_mgf_only), bool(ms2_only), bool(ms1_only)]
+    if sum(mode_flags) > 1:
+        raise ValueError("--ms2-mgf-only, --ms2-only, and --ms1-only are mutually exclusive")
+    if no_ms1 and ms1_only:
+        raise ValueError("--no-ms1 cannot be used with --ms1-only")
+    start_scan = coerce_optional_scan("start_scan", start_scan)
+    end_scan = coerce_optional_scan("end_scan", end_scan)
+    if start_scan is not None and end_scan is not None and start_scan > end_scan:
+        raise ValueError("--start-scan cannot be greater than --end-scan")
+
+    mode = "default"
+    if ms2_mgf_only:
+        mode = "ms2_mgf_only"
+    elif ms2_only:
+        mode = "ms2_only"
+    elif ms1_only:
+        mode = "ms1_only"
+
+    return {
+        "mode": mode,
+        "ms2_mgf_only": bool(ms2_mgf_only),
+        "ms2_only": bool(ms2_only),
+        "ms1_only": bool(ms1_only),
+        "no_ms1": bool(no_ms1),
+        "start_scan": start_scan,
+        "end_scan": end_scan,
+        "include_mgf": not ms1_only,
+        "include_ms1": ms1_only or (not no_ms1 and not ms2_mgf_only and not ms2_only),
+        "include_ms2_detail": not ms1_only and not ms2_mgf_only,
+        "include_msn_detail": mode == "default",
+    }
+
+
+def coerce_optional_scan(name, value):
+    if value is None:
+        return None
+    try:
+        scan = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer: {value!r}") from exc
+    if scan < 0:
+        raise ValueError(f"{name} must be non-negative: {scan}")
+    return scan
 
 
 def validate_input_paths(source: Path, output: Path, *, overwrite: bool):
@@ -240,7 +401,7 @@ def apply_compression(conn, compression, compression_level):
     return warnings
 
 
-def pre_scan_mzml(source: Path) -> dict:
+def pre_scan_mzml(source: Path, options: dict) -> dict:
     rt_units = set()
     polarities = set()
     centroided_values = set()
@@ -249,34 +410,41 @@ def pre_scan_mzml(source: Path) -> dict:
     intensity_dtypes = set()
     id_scan_pairs = []
     warnings = []
+    source_counts = Counter()
+    source_peak_counts = Counter()
+    included_counts = Counter()
+    included_peak_counts = Counter()
+    included_scan_numbers = set()
 
     with mzml.MzML(str(source)) as reader:
-        for source_order, spectrum in enumerate(reader):
+        for source_index, spectrum in enumerate(reader):
             ms_level = as_int(spectrum.get("ms level"))
-            if ms_level != 2:
-                raise ValueError(
-                    f"Unsupported spectrum ms level at source index {source_order}: "
-                    f"{ms_level}"
-                )
-            if "m/z array" not in spectrum or "intensity array" not in spectrum:
-                raise ValueError(f"Spectrum {source_order} is missing required arrays")
+            if ms_level is None:
+                raise ValueError(f"Spectrum {source_index} is missing ms level")
+            native_id = str(spectrum.get("id") or "")
+            scan_number = resolve_scan_number(spectrum, native_id, source_index)
+            mz_array, intensity_array = required_arrays(spectrum, source_index)
 
-            mz_array = np.asarray(spectrum["m/z array"])
-            intensity_array = np.asarray(spectrum["intensity array"])
-            if len(mz_array) != len(intensity_array):
-                raise ValueError(
-                    f"Spectrum {source_order} has mismatched m/z and intensity "
-                    f"lengths: {len(mz_array)} != {len(intensity_array)}"
-                )
+            source_counts[ms_level] += 1
+            source_peak_counts[ms_level] += len(mz_array)
+            if not include_spectrum(ms_level, scan_number, options):
+                continue
+
+            if scan_number in included_scan_numbers:
+                raise ValueError(f"Duplicate scan_number in selected spectra: {scan_number}")
+            included_scan_numbers.add(scan_number)
+
             mz_dtypes.add(str(mz_array.dtype))
             intensity_dtypes.add(str(intensity_array.dtype))
+            included_counts[ms_level] += 1
+            included_peak_counts[ms_level] += len(mz_array)
 
             scan = first_nested(spectrum, "scanList", "scan", 0)
             if scan is None or "scan start time" not in scan:
-                raise ValueError(f"Spectrum {source_order} is missing scan start time")
+                raise ValueError(f"Spectrum {source_index} is missing scan start time")
             rt, rt_unit = numeric_with_unit(scan["scan start time"], default_unit="minute")
             if rt is None:
-                raise ValueError(f"Spectrum {source_order} has non-numeric scan start time")
+                raise ValueError(f"Spectrum {source_index} has non-numeric scan start time")
             rt_units.add(normalize_unit(rt_unit, default="minute"))
 
             polarity = spectrum_polarity(spectrum)
@@ -293,18 +461,18 @@ def pre_scan_mzml(source: Path) -> dict:
                 )
                 ion_injection_units.add(normalize_unit(unit, default="millisecond"))
 
-            native_id = str(spectrum.get("id") or "")
-            scan_number = resolve_scan_number(spectrum, native_id, source_order)
             id_scan_pairs.append((native_id, scan_number))
 
+    if not included_counts:
+        raise ValueError("No spectra matched the requested mzDuck import options")
     if len(rt_units) != 1:
         raise ValueError(f"Mixed or missing retention time units in mzML: {sorted(rt_units)}")
     if len(polarities) > 1:
         raise ValueError(f"Mixed polarity values in mzML: {sorted(polarities)}")
     if False in centroided_values:
-        raise ValueError("v1 mzDuck only supports centroid spectra")
+        raise ValueError("mzDuck only supports centroid spectra")
     if True not in centroided_values:
-        raise ValueError("No centroid spectrum indicator found in mzML")
+        raise ValueError("No centroid spectrum indicator found in selected mzML spectra")
     if len(ion_injection_units) > 1:
         raise ValueError(
             "Mixed ion injection time units in mzML: "
@@ -329,8 +497,43 @@ def pre_scan_mzml(source: Path) -> dict:
         "intensity_array_dtypes": sorted(intensity_dtypes),
         "mz_array_storage_dtype": mz_storage,
         "intensity_array_storage_dtype": intensity_storage,
+        "source_counts": dict(sorted(source_counts.items())),
+        "source_peak_counts": dict(sorted(source_peak_counts.items())),
+        "included_counts": dict(sorted(included_counts.items())),
+        "included_peak_counts": dict(sorted(included_peak_counts.items())),
         "warnings": warnings,
     }
+
+
+def include_spectrum(ms_level, scan_number, options):
+    if ms_level is None:
+        return False
+    start_scan = options.get("start_scan")
+    end_scan = options.get("end_scan")
+    if start_scan is not None and scan_number < start_scan:
+        return False
+    if end_scan is not None and scan_number > end_scan:
+        return False
+    if options["ms1_only"]:
+        return ms_level == 1
+    if options["ms2_mgf_only"] or options["ms2_only"]:
+        return ms_level == 2
+    if options["no_ms1"] and ms_level == 1:
+        return False
+    return ms_level >= 1
+
+
+def required_arrays(spectrum, source_index):
+    if "m/z array" not in spectrum or "intensity array" not in spectrum:
+        raise ValueError(f"Spectrum {source_index} is missing required arrays")
+    mz_array = np.asarray(spectrum["m/z array"])
+    intensity_array = np.asarray(spectrum["intensity array"])
+    if len(mz_array) != len(intensity_array):
+        raise ValueError(
+            f"Spectrum {source_index} has mismatched m/z and intensity lengths: "
+            f"{len(mz_array)} != {len(intensity_array)}"
+        )
+    return mz_array, intensity_array
 
 
 def storage_type_for_dtypes(dtypes, label):
@@ -360,23 +563,15 @@ def infer_native_id_template(id_scan_pairs):
     return candidate
 
 
-def spectrum_to_row(spectrum, *, source_order: int, constants: dict):
+def spectrum_to_record(spectrum, *, source_index: int, constants: dict):
     warnings: list[str] = []
     native_id = str(spectrum.get("id") or "")
-    scan_number = resolve_scan_number(spectrum, native_id, source_order)
+    scan_number = resolve_scan_number(spectrum, native_id, source_index)
     ms_level = as_int(spectrum.get("ms level"))
-    if ms_level != 2:
-        raise ValueError(
-            f"Unsupported spectrum ms level at source index {source_order}: {ms_level}"
-        )
+    if ms_level is None:
+        raise ValueError(f"Spectrum {source_index} is missing ms level")
 
-    mz_array = np.asarray(spectrum["m/z array"])
-    intensity_array = np.asarray(spectrum["intensity array"])
-    if len(mz_array) != len(intensity_array):
-        raise ValueError(
-            f"Spectrum {source_order} has mismatched m/z and intensity lengths: "
-            f"{len(mz_array)} != {len(intensity_array)}"
-        )
+    mz_array, intensity_array = required_arrays(spectrum, source_index)
     mz_array = mz_array.astype(numpy_dtype_for_storage(constants["mz_array_storage_dtype"]), copy=False)
     intensity_array = intensity_array.astype(
         numpy_dtype_for_storage(constants["intensity_array_storage_dtype"]),
@@ -385,32 +580,32 @@ def spectrum_to_row(spectrum, *, source_order: int, constants: dict):
 
     scan = first_nested(spectrum, "scanList", "scan", 0)
     if scan is None or "scan start time" not in scan:
-        raise ValueError(f"Spectrum {source_order} is missing scan start time")
+        raise ValueError(f"Spectrum {source_index} is missing scan start time")
     rt, rt_unit = numeric_with_unit(scan["scan start time"], default_unit="minute")
     rt_unit = normalize_unit(rt_unit, default="minute")
     if rt_unit != constants["rt_unit"]:
         raise ValueError(
-            f"Spectrum {source_order} has RT unit {rt_unit!r}; expected "
+            f"Spectrum {source_index} has RT unit {rt_unit!r}; expected "
             f"{constants['rt_unit']!r}"
         )
     if rt is None:
-        raise ValueError(f"Spectrum {source_order} has non-numeric scan start time")
+        raise ValueError(f"Spectrum {source_index} has non-numeric scan start time")
 
     polarity = spectrum_polarity(spectrum)
     if polarity and constants["polarity"] and polarity != constants["polarity"]:
         raise ValueError(
-            f"Spectrum {source_order} has polarity {polarity!r}; expected "
+            f"Spectrum {source_index} has polarity {polarity!r}; expected "
             f"{constants['polarity']!r}"
         )
     centroided = spectrum_centroided(spectrum)
     if centroided is False:
-        raise ValueError("v1 mzDuck only supports centroid spectra")
+        raise ValueError("mzDuck only supports centroid spectra")
 
     precursor = first_nested(spectrum, "precursorList", "precursor", 0, default={})
     precursor_list = first_nested(spectrum, "precursorList", "precursor", default=[])
     if isinstance(precursor_list, list) and len(precursor_list) > 1:
         warnings.append(
-            f"Spectrum {source_order} has multiple precursors; stored first precursor"
+            f"Spectrum {source_index} has multiple precursors; stored first precursor"
         )
     selected_ion = first_nested(
         precursor, "selectedIonList", "selectedIon", 0, default={}
@@ -423,7 +618,7 @@ def spectrum_to_row(spectrum, *, source_order: int, constants: dict):
     activation_type = activation_type_from_dict(activation)
     if activation_type and activation_type not in set(ACTIVATION_MAP.values()):
         warnings.append(
-            f"Spectrum {source_order} has unknown activation term: {activation_type}"
+            f"Spectrum {source_index} has unknown activation term: {activation_type}"
         )
 
     ion_injection_time = None
@@ -434,7 +629,7 @@ def spectrum_to_row(spectrum, *, source_order: int, constants: dict):
         injection_unit = normalize_unit(injection_unit, default="millisecond")
         if injection_unit != constants["ion_injection_time_unit"]:
             raise ValueError(
-                f"Spectrum {source_order} has ion injection unit {injection_unit!r}; "
+                f"Spectrum {source_index} has ion injection unit {injection_unit!r}; "
                 f"expected {constants['ion_injection_time_unit']!r}"
             )
 
@@ -451,8 +646,9 @@ def spectrum_to_row(spectrum, *, source_order: int, constants: dict):
     if not template or template.format(scan_number=scan_number) != native_id:
         stored_native_id = native_id or None
 
-    row = {
+    record = {
         "scan_number": scan_number,
+        "source_index": source_index,
         "native_id": stored_native_id,
         "ms_level": ms_level,
         "rt": rt,
@@ -500,18 +696,62 @@ def spectrum_to_row(spectrum, *, source_order: int, constants: dict):
             )
         ),
     }
-    return row, mz_array, intensity_array, warnings
+    return record, mz_array, intensity_array, warnings
 
 
-def resolve_scan_number(spectrum, native_id, source_order):
+def mgf_row(record, mz_array, intensity_array, *, title_source):
+    charge = record["precursor_charge"]
+    title_charge = int(charge) if charge is not None else 0
+    scan_number = int(record["scan_number"])
+    return {
+        "scan_number": scan_number,
+        "title": f"{title_source}.{scan_number}.{scan_number}.{title_charge}",
+        "rt": record["rt"],
+        "precursor_mz": record["precursor_mz"],
+        "precursor_intensity": record["precursor_intensity"],
+        "precursor_charge": charge,
+        "mz_array": mz_array,
+        "intensity_array": intensity_array,
+    }
+
+
+def ms1_row(record, mz_array, intensity_array):
+    row = {column: record[column] for column in MS1_COLUMNS if column in record}
+    row["mz_array"] = mz_array
+    row["intensity_array"] = intensity_array
+    return row
+
+
+def ms2_row(record):
+    return {column: record[column] for column in MS2_COLUMNS}
+
+
+def msn_row(record, mz_array, intensity_array):
+    row = {column: record[column] for column in MSN_COLUMNS if column in record}
+    row["mz_array"] = mz_array
+    row["intensity_array"] = intensity_array
+    return row
+
+
+def summary_row(record, *, table_name, peak_count, included_in_mgf):
+    return {
+        "scan_number": record["scan_number"],
+        "source_index": record["source_index"],
+        "ms_level": record["ms_level"],
+        "table_name": table_name,
+        "rt": record["rt"],
+        "peak_count": int(peak_count),
+        "native_id": record["native_id"],
+        "included_in_mgf": bool(included_in_mgf),
+    }
+
+
+def resolve_scan_number(spectrum, native_id, source_index):
     scan_number = parse_scan_number(native_id)
     if scan_number is None:
         scan_number = as_int(spectrum.get("index"))
     if scan_number is None:
-        raise ValueError(
-            "Cannot resolve scan_number for spectrum at source index "
-            f"{source_order}"
-        )
+        scan_number = source_index + 1
     return scan_number
 
 
@@ -557,40 +797,122 @@ def pyarrow_value_type_for_storage(storage_type):
     raise ValueError(f"Unsupported storage type: {storage_type!r}")
 
 
-def flush_batches(
+class TableBatch:
+    def __init__(
+        self,
+        conn,
+        table_name,
+        columns,
+        *,
+        batch_size,
+        mz_storage_type,
+        intensity_storage_type,
+    ):
+        self.conn = conn
+        self.table_name = table_name
+        self.columns = list(columns)
+        self.batch_size = batch_size
+        self.mz_storage_type = mz_storage_type
+        self.intensity_storage_type = intensity_storage_type
+        self.rows = []
+
+    def append(self, row):
+        self.rows.append(row)
+        if len(self.rows) >= self.batch_size:
+            self.flush()
+
+    def flush(self):
+        if not self.rows:
+            return
+        data = {}
+        for column in self.columns:
+            if column == "mz_array":
+                data[column] = make_list_array(
+                    [row[column] for row in self.rows],
+                    pyarrow_value_type_for_storage(self.mz_storage_type),
+                    numpy_dtype_for_storage(self.mz_storage_type),
+                )
+            elif column == "intensity_array":
+                data[column] = make_list_array(
+                    [row[column] for row in self.rows],
+                    pyarrow_value_type_for_storage(self.intensity_storage_type),
+                    numpy_dtype_for_storage(self.intensity_storage_type),
+                )
+            else:
+                data[column] = pa.array(
+                    [row.get(column) for row in self.rows],
+                    type=SCALAR_ARROW_TYPES[column],
+                )
+        table = pa.table({column: data[column] for column in self.columns})
+        view_name = f"_mzduck_{self.table_name}_batch"
+        self.conn.register(view_name, table)
+        try:
+            self.conn.execute(f"INSERT INTO {self.table_name} SELECT * FROM {view_name}")
+        finally:
+            self.conn.unregister(view_name)
+        self.rows.clear()
+
+
+def build_batches(
+    *,
     conn,
-    rows,
-    mz_arrays,
-    intensity_arrays,
+    include_mgf,
+    include_ms1,
+    include_ms2,
+    msn_levels,
+    include_summary,
+    batch_size,
     mz_storage_type,
     intensity_storage_type,
 ):
-    if not rows:
-        return
-    data = {
-        column: pa.array([row[column] for row in rows], type=SCALAR_ARROW_TYPES[column])
-        for column in SPECTRA_COLUMNS
-        if column not in {"mz_array", "intensity_array"}
-    }
-    data["mz_array"] = make_list_array(
-        mz_arrays,
-        pyarrow_value_type_for_storage(mz_storage_type),
-        numpy_dtype_for_storage(mz_storage_type),
-    )
-    data["intensity_array"] = make_list_array(
-        intensity_arrays,
-        pyarrow_value_type_for_storage(intensity_storage_type),
-        numpy_dtype_for_storage(intensity_storage_type),
-    )
-    table = pa.table({column: data[column] for column in SPECTRA_COLUMNS})
-    conn.register("_mzduck_spectra_batch", table)
-    try:
-        conn.execute("INSERT INTO spectra SELECT * FROM _mzduck_spectra_batch")
-    finally:
-        conn.unregister("_mzduck_spectra_batch")
-    rows.clear()
-    mz_arrays.clear()
-    intensity_arrays.clear()
+    batches = {}
+    if include_mgf:
+        batches["mgf"] = TableBatch(
+            conn,
+            "mgf",
+            MGF_COLUMNS,
+            batch_size=batch_size,
+            mz_storage_type=mz_storage_type,
+            intensity_storage_type=intensity_storage_type,
+        )
+    if include_ms1:
+        batches["ms1_spectra"] = TableBatch(
+            conn,
+            "ms1_spectra",
+            MS1_COLUMNS,
+            batch_size=batch_size,
+            mz_storage_type=mz_storage_type,
+            intensity_storage_type=intensity_storage_type,
+        )
+    if include_ms2:
+        batches["ms2_spectra"] = TableBatch(
+            conn,
+            "ms2_spectra",
+            MS2_COLUMNS,
+            batch_size=batch_size,
+            mz_storage_type=mz_storage_type,
+            intensity_storage_type=intensity_storage_type,
+        )
+    for level in msn_levels:
+        table_name = msn_table_name(level)
+        batches[table_name] = TableBatch(
+            conn,
+            table_name,
+            MSN_COLUMNS,
+            batch_size=batch_size,
+            mz_storage_type=mz_storage_type,
+            intensity_storage_type=intensity_storage_type,
+        )
+    if include_summary:
+        batches["spectrum_summary"] = TableBatch(
+            conn,
+            "spectrum_summary",
+            SPECTRUM_SUMMARY_COLUMNS,
+            batch_size=batch_size,
+            mz_storage_type=mz_storage_type,
+            intensity_storage_type=intensity_storage_type,
+        )
+    return batches
 
 
 def make_list_array(arrays, value_type, numpy_dtype):
@@ -610,40 +932,193 @@ def make_list_array(arrays, value_type, numpy_dtype):
     )
 
 
-def validate_import(conn, expected_spectrum_count, expected_peak_count):
-    spectrum_count = conn.execute("SELECT COUNT(*) FROM spectra").fetchone()[0]
-    if spectrum_count != expected_spectrum_count:
+def validate_import(
+    conn,
+    *,
+    expected_counts,
+    expected_peak_counts,
+    include_mgf,
+    include_ms1,
+    include_ms2,
+    msn_levels,
+    include_summary,
+):
+    if include_mgf:
+        validate_array_table(
+            conn,
+            "mgf",
+            expected_counts.get(2, 0),
+            expected_peak_counts.get(2, 0),
+        )
+        duplicates = conn.execute(
+            "SELECT COUNT(*) - COUNT(DISTINCT scan_number) FROM mgf"
+        ).fetchone()[0]
+        if duplicates:
+            raise ValueError(f"{duplicates} duplicate scan_number values in mgf")
+    if include_ms1:
+        validate_array_table(
+            conn,
+            "ms1_spectra",
+            expected_counts.get(1, 0),
+            expected_peak_counts.get(1, 0),
+        )
+    if include_ms2:
+        count = conn.execute("SELECT COUNT(*) FROM ms2_spectra").fetchone()[0]
+        if count != expected_counts.get(2, 0):
+            raise ValueError(
+                f"Imported ms2_spectra count mismatch: {count} != "
+                f"{expected_counts.get(2, 0)}"
+            )
+    for level in msn_levels:
+        table_name = msn_table_name(level)
+        validate_array_table(
+            conn,
+            table_name,
+            expected_counts.get(level, 0),
+            expected_peak_counts.get(level, 0),
+        )
+    if include_summary:
+        expected = sum(expected_counts.values())
+        count = conn.execute("SELECT COUNT(*) FROM spectrum_summary").fetchone()[0]
+        if count != expected:
+            raise ValueError(f"spectrum_summary count mismatch: {count} != {expected}")
+
+
+def validate_array_table(conn, table_name, expected_spectrum_count, expected_peak_count):
+    count = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
+    if count != expected_spectrum_count:
         raise ValueError(
-            f"Imported spectrum count mismatch: {spectrum_count} != "
+            f"Imported {table_name} count mismatch: {count} != "
             f"{expected_spectrum_count}"
         )
     peak_count = conn.execute(
-        "SELECT COALESCE(SUM(len(mz_array)), 0) FROM spectra"
+        f"SELECT COALESCE(SUM(len(mz_array)), 0) FROM {table_name}"
     ).fetchone()[0]
     if peak_count != expected_peak_count:
         raise ValueError(
-            f"Imported peak count mismatch: {peak_count} != {expected_peak_count}"
+            f"Imported {table_name} peak count mismatch: {peak_count} != "
+            f"{expected_peak_count}"
         )
     mismatched = conn.execute(
-        """
+        f"""
         SELECT COUNT(*)
-        FROM spectra
+        FROM {table_name}
         WHERE len(mz_array) != len(intensity_array)
         """
     ).fetchone()[0]
     if mismatched:
-        raise ValueError(f"{mismatched} spectra have mismatched array lengths")
-    duplicate_scan_numbers = conn.execute(
-        "SELECT COUNT(*) - COUNT(DISTINCT scan_number) FROM spectra"
-    ).fetchone()[0]
-    if duplicate_scan_numbers:
-        raise ValueError(f"{duplicate_scan_numbers} duplicate scan_number values")
-    null_arrays = conn.execute(
-        """
-        SELECT COUNT(*)
-        FROM spectra
-        WHERE mz_array IS NULL OR intensity_array IS NULL
-        """
-    ).fetchone()[0]
-    if null_arrays:
-        raise ValueError(f"{null_arrays} spectra have NULL peak arrays")
+        raise ValueError(f"{mismatched} spectra in {table_name} have mismatched arrays")
+
+
+def build_summary_metadata(conn, *, inserted_counts, inserted_peak_counts, warnings):
+    total_spectra = sum(inserted_counts.values())
+    total_peaks = sum(inserted_peak_counts.values())
+    metadata = {
+        "total_spectrum_count": str(total_spectra),
+        "total_peak_count": str(total_peaks),
+        "spectrum_count": str(total_spectra),
+        "peak_count": str(total_peaks),
+        "mgf_spectrum_count": str(table_count(conn, "mgf")),
+        "mgf_peak_count": str(table_peak_count(conn, "mgf")),
+        "table_registry": metadata_json(table_registry(conn)),
+        "conversion_warnings": json.dumps(warnings, sort_keys=True),
+    }
+    for level in sorted(inserted_counts):
+        metadata[f"ms{level}_spectrum_count"] = str(inserted_counts[level])
+        metadata[f"ms{level}_peak_count"] = str(inserted_peak_counts[level])
+    if 1 not in inserted_counts:
+        metadata["ms1_spectrum_count"] = "0"
+        metadata["ms1_peak_count"] = "0"
+    if 2 not in inserted_counts:
+        metadata["ms2_spectrum_count"] = "0"
+        metadata["ms2_peak_count"] = "0"
+    return metadata
+
+
+def table_count(conn, table_name):
+    if not table_exists(conn, table_name):
+        return 0
+    return int(conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0])
+
+
+def table_peak_count(conn, table_name):
+    if not table_exists(conn, table_name):
+        return 0
+    columns = set(
+        row[1] for row in conn.execute(f"PRAGMA table_info('{table_name}')").fetchall()
+    )
+    if "mz_array" not in columns:
+        return 0
+    return int(
+        conn.execute(
+            f"SELECT COALESCE(SUM(len(mz_array)), 0) FROM {table_name}"
+        ).fetchone()[0]
+    )
+
+
+def table_registry(conn):
+    index_rows = conn.execute(
+        "SELECT table_name, index_name FROM duckdb_indexes()"
+    ).fetchall()
+    indexed_by_table = {}
+    for table_name, index_name in index_rows:
+        indexed_by_table.setdefault(table_name, []).append(index_name)
+
+    registry = []
+    for table_name in [
+        "mgf",
+        "ms1_spectra",
+        "ms2_spectra",
+        "spectrum_summary",
+    ]:
+        if table_exists(conn, table_name):
+            registry.append(registry_entry(conn, table_name, indexed_by_table))
+
+    msn_tables = [
+        row[0]
+        for row in conn.execute(
+            """
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = 'main'
+              AND regexp_matches(table_name, '^ms[3-9][0-9]*_spectra$')
+            ORDER BY table_name
+            """
+        ).fetchall()
+    ]
+    for table_name in msn_tables:
+        registry.append(registry_entry(conn, table_name, indexed_by_table))
+    return registry
+
+
+def registry_entry(conn, table_name, indexed_by_table):
+    columns = set(row[1] for row in conn.execute(f"PRAGMA table_info('{table_name}')").fetchall())
+    row_count = table_count(conn, table_name)
+    peak_count = table_peak_count(conn, table_name)
+    ms_level = None
+    if table_name == "mgf":
+        ms_level = 2
+        role = "MGF export contract"
+    elif table_name == "ms1_spectra":
+        ms_level = 1
+        role = "MS1 spectra and peaks"
+    elif table_name == "ms2_spectra":
+        ms_level = 2
+        role = "MS2 mzML metadata outside MGF"
+    elif table_name == "spectrum_summary":
+        role = "included spectrum summary"
+    else:
+        ms_level = int(table_name[2:].split("_", 1)[0])
+        role = f"MS{ms_level} spectra and peaks"
+    indexed_columns = []
+    if table_name in indexed_by_table and "scan_number" in columns:
+        indexed_columns.append("scan_number")
+    return {
+        "table": table_name,
+        "role": role,
+        "ms_level": ms_level,
+        "row_count": row_count,
+        "peak_count": peak_count,
+        "indexed_columns": indexed_columns,
+        "included": True,
+    }

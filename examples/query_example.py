@@ -29,7 +29,7 @@ def main() -> None:
         rows = db.query(
             """
             SELECT scan_number, rt, precursor_mz, precursor_charge
-            FROM spectra
+            FROM mgf
             WHERE precursor_mz BETWEEN ? AND ?
             ORDER BY rt
             """,
@@ -41,12 +41,17 @@ def main() -> None:
         print("\nProduct-ion XIC around m/z 150")
         rows = db.query(
             """
-            SELECT s.rt, SUM(p.intensity) AS xic
-            FROM spectra s
-            JOIN peaks p ON p.scan_number = s.scan_number
-            WHERE p.mz BETWEEN ? AND ?
-            GROUP BY s.rt
-            ORDER BY s.rt
+            SELECT rt, SUM(intensity) AS xic
+            FROM (
+                SELECT
+                    rt,
+                    UNNEST(mz_array) AS mz,
+                    UNNEST(intensity_array) AS intensity
+                FROM mgf
+            ) peaks
+            WHERE mz BETWEEN ? AND ?
+            GROUP BY rt
+            ORDER BY rt
             """,
             [149.0, 151.0],
         ).fetchall()

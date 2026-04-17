@@ -1,12 +1,13 @@
 # mzDuck
 
-mzDuck is a Python package for storing centroid MS2 mzML data in a single
-DuckDB database file. It keeps spectra and peaks queryable with ordinary SQL
-while preserving enough metadata for MGF export and semantic mzML export.
+mzDuck is a Python package for storing centroid mzML spectra in a single
+DuckDB database file. It keeps the MGF export content in a narrow `mgf` table,
+stores MS1/MS2/MSn detail tables separately, and records mzML header fragments
+plus table summaries in `run_metadata`.
 
 The current v1 scope is intentionally focused:
 
-- input: centroid MS2 mzML;
+- input: centroid mzML;
 - storage: one `.mzduck` DuckDB database per source run;
 - output: `.mgf` and `.mzML`;
 - API: Python class plus `mzduck` command-line tool.
@@ -69,6 +70,28 @@ mzduck convert \
   --compression zstd
 ```
 
+Convert only the MGF-relevant MS2 data:
+
+```bash
+mzduck convert input.mzML -o /tmp/ms2-mgf-only.mzduck --ms2-mgf-only --overwrite
+```
+
+Convert a scan window or select MS levels:
+
+```bash
+mzduck convert input.withMS1.mzML -o /tmp/window.mzduck --start-scan 1000 --end-scan 2000
+mzduck convert input.withMS1.mzML -o /tmp/ms1-only.mzduck --ms1-only
+mzduck convert input.withMS1.mzML -o /tmp/ms2-only.mzduck --ms2-only
+mzduck convert input.withMS1.mzML -o /tmp/no-ms1.mzduck --no-ms1
+```
+
+Create the optional scan lookup index. The index is only created on
+`mgf(scan_number)`:
+
+```bash
+mzduck convert input.mzML -o /tmp/indexed.mzduck --index-scan --overwrite
+```
+
 Inspect the mzDuck file:
 
 ```bash
@@ -128,7 +151,7 @@ try:
     rows = db.query(
         """
         SELECT scan_number, rt, precursor_mz, precursor_charge
-        FROM spectra
+        FROM mgf
         WHERE precursor_mz BETWEEN ? AND ?
         ORDER BY rt
         """,
@@ -157,7 +180,7 @@ Find precursor spectra in a mass window:
 
 ```sql
 SELECT scan_number, rt, precursor_mz, precursor_charge
-FROM spectra
+FROM mgf
 WHERE precursor_mz BETWEEN 440.0 AND 450.0
 ORDER BY rt;
 ```
@@ -165,8 +188,11 @@ ORDER BY rt;
 Get peaks for one spectrum in source order:
 
 ```sql
-SELECT mz, intensity
-FROM peaks
+SELECT
+  generate_subscripts(mz_array, 1) - 1 AS peak_index,
+  UNNEST(mz_array) AS mz,
+  UNNEST(intensity_array) AS intensity
+FROM mgf
 WHERE scan_number = 1
 ORDER BY peak_index;
 ```
@@ -174,12 +200,17 @@ ORDER BY peak_index;
 Extract a product-ion chromatogram:
 
 ```sql
-SELECT s.rt, SUM(p.intensity) AS xic
-FROM spectra s
-JOIN peaks p ON p.scan_number = s.scan_number
-WHERE p.mz BETWEEN 149.0 AND 151.0
-GROUP BY s.rt
-ORDER BY s.rt;
+SELECT rt, SUM(intensity) AS xic
+FROM (
+  SELECT
+    rt,
+    UNNEST(mz_array) AS mz,
+    UNNEST(intensity_array) AS intensity
+  FROM mgf
+) peaks
+WHERE mz BETWEEN 149.0 AND 151.0
+GROUP BY rt
+ORDER BY rt;
 ```
 
 ## Example Scripts
@@ -198,20 +229,25 @@ Run a full conversion/export workflow:
 
 ## Schema Summary
 
-The v1 database has two required tables and one required compatibility view:
+The v1 database always has `run_metadata` plus the selected data tables:
 
-- `spectra`: one row per imported MS2 spectrum with retention time, precursor
-  metadata, scan metadata, activation type, scan windows, TIC, base peak, and
-  source identifiers. Peak data is stored as per-spectrum `mz_array` and
-  `intensity_array` list columns.
-- `peaks`: a view exposing `scan_number`, `peak_index`, `mz`, and `intensity`
-  for familiar peak-level SQL. `peak_index` preserves source array order.
-- `run_metadata`: schema version, provenance, source metadata, counts, dtypes,
-  and mzML header snapshots.
+- `run_metadata`: schema version, provenance, mzML header XML fragments,
+  source counts, included counts, dtype/compression settings, and a JSON
+  `table_registry` describing every table in the DuckDB file.
+- `mgf`: one row per exported MS2 MGF block. It stores only MGF content:
+  `title`, `rt`, precursor fields, and peak arrays.
+- `ms2_spectra`: non-MGF MS2 metadata used for richer mzML export, including
+  native id, activation, collision energy, isolation window, scan windows, TIC,
+  base peak, and filter string.
+- `ms1_spectra`: MS1 metadata plus MS1 peak arrays when MS1 is included.
+- `msN_spectra`: separate higher-level tables such as `ms3_spectra` when MSn
+  spectra are present in default mode.
+- `spectrum_summary`: one row per included spectrum in all modes except
+  `--ms2-mgf-only`.
 
 The schema creates no secondary indexes by default. Use
-`mzduck convert --index-scan-number` when repeated exact scan-number lookups need
-an ART index.
+`mzduck convert --index-scan` when repeated exact scan-number lookups need an
+ART index on `mgf(scan_number)`.
 
 See `design/20260416design.codex.md` for the complete v1 specification.
 
@@ -229,7 +265,7 @@ and validate round-trip parsing.
 ## Notes
 
 - mzML export uses `psims`.
-- v1 mzML round-trip means semantic equivalence for supported MS2 fields, not
+- v1 mzML round-trip means semantic equivalence for supported fields, not
   byte-identical XML.
 - The full-size validation fixture from the design is much larger and is not
   bundled with the package.

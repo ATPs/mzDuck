@@ -1,4 +1,4 @@
-"""mzDuck: DuckDB-backed storage for centroid MS2 mzML data."""
+"""mzDuck: DuckDB-backed storage for centroid mzML spectra."""
 
 __version__ = "0.1.0"
 
@@ -14,8 +14,15 @@ def from_mzml(
     batch_size=5000,
     compression="zstd",
     compression_level=6,
+    index_scan=False,
     index_scan_number=False,
     compute_sha256=True,
+    ms2_mgf_only=False,
+    no_ms1=False,
+    ms2_only=False,
+    ms1_only=False,
+    start_scan=None,
+    end_scan=None,
 ):
     """Convert one mzML file into one mzDuck file."""
     return MzDuckFile.from_mzml(
@@ -25,8 +32,15 @@ def from_mzml(
         batch_size=batch_size,
         compression=compression,
         compression_level=compression_level,
+        index_scan=index_scan,
         index_scan_number=index_scan_number,
         compute_sha256=compute_sha256,
+        ms2_mgf_only=ms2_mgf_only,
+        no_ms1=no_ms1,
+        ms2_only=ms2_only,
+        ms1_only=ms1_only,
+        start_scan=start_scan,
+        end_scan=end_scan,
     )
 
 

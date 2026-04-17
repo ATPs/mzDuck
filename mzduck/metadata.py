@@ -168,8 +168,8 @@ def read_mzml_header_prefix(
 def extract_xml_fragment(header: bytes, tag: str) -> str | None:
     tag_bytes = tag.encode("ascii")
     pattern = re.compile(
-        rb"<(?P<prefix>[A-Za-z_][\w.\-]*:)?" + tag_bytes +
-        rb"\b[^>]*>.*?</(?P=prefix)" + tag_bytes + rb">",
+        rb"<(?:[A-Za-z_][\w.\-]*:)?" + tag_bytes +
+        rb"\b[^>]*>.*?</(?:[A-Za-z_][\w.\-]*:)?" + tag_bytes + rb">",
         re.DOTALL,
     )
     match = pattern.search(header)

@@ -140,3 +140,124 @@ def tiny_mzduck(tmp_path, tiny_mzml):
     )
     handle.close()
     return path
+
+
+@pytest.fixture
+def tiny_with_ms1_mzml(tmp_path):
+    from psims.mzml import MzMLWriter
+
+    path = tmp_path / "tiny-with-ms1.mzML"
+    with path.open("wb") as stream:
+        with MzMLWriter(stream, close=False, missing_reference_is_error=False) as out:
+            out.register("Software", "mzduck-test")
+            out.controlled_vocabularies()
+            out.file_description(["MS1 spectrum", "MSn spectrum"])
+            out.software_list(
+                [
+                    out.Software(
+                        version="0.0.0",
+                        id="mzduck-test",
+                        params=["custom unreleased software tool", "python-psims"],
+                    )
+                ]
+            )
+            out.instrument_configuration_list(
+                [
+                    out.InstrumentConfiguration(
+                        id="IC1",
+                        component_list=out.ComponentList(
+                            [
+                                out.Source(params=["electrospray ionization"], order=1),
+                                out.Analyzer(params=["quadrupole"], order=2),
+                                out.Detector(params=["inductive detector"], order=3),
+                            ]
+                        ),
+                    )
+                ]
+            )
+            out.data_processing_list(
+                [
+                    out.DataProcessing(
+                        processing_methods=[
+                            {
+                                "order": 0,
+                                "software_reference": "mzduck-test",
+                                "params": ["Conversion to mzML"],
+                            }
+                        ],
+                        id="mzduck-test-processing",
+                    )
+                ]
+            )
+            with out.run(id="tiny_with_ms1_run"):
+                with out.spectrum_list(count=3):
+                    out.write_spectrum(
+                        mz_array=np.asarray([400.0, 500.0], dtype=np.float32),
+                        intensity_array=np.asarray([100.0, 200.0], dtype=np.float32),
+                        id="controllerType=0 controllerNumber=1 scan=1",
+                        polarity="positive scan",
+                        centroided=True,
+                        scan_start_time=0.5,
+                        params=[
+                            {"ms level": 1},
+                            {"total ion current": 300.0},
+                            {"base peak m/z": 500.0},
+                            {
+                                "name": "base peak intensity",
+                                "value": 200.0,
+                                "unit_accession": "MS:1000131",
+                            },
+                        ],
+                    )
+                    out.write_spectrum(
+                        mz_array=np.asarray([100.0, 150.0], dtype=np.float32),
+                        intensity_array=np.asarray([10.0, 20.0], dtype=np.float32),
+                        id="controllerType=0 controllerNumber=1 scan=2",
+                        polarity="positive scan",
+                        centroided=True,
+                        scan_start_time=0.75,
+                        params=[
+                            {"ms level": 2},
+                            {"total ion current": 30.0},
+                            {"base peak m/z": 150.0},
+                            {
+                                "name": "base peak intensity",
+                                "value": 20.0,
+                                "unit_accession": "MS:1000131",
+                            },
+                        ],
+                        precursor_information={
+                            "mz": 500.2,
+                            "intensity": 600.0,
+                            "charge": 2,
+                            "scan_id": "controllerType=0 controllerNumber=1 scan=1",
+                            "activation": [
+                                "collision-induced dissociation",
+                                {"collision energy": 30.0},
+                            ],
+                            "isolation_window": {
+                                "target": 500.2,
+                                "lower": 0.5,
+                                "upper": 0.5,
+                            },
+                        },
+                    )
+                    out.write_spectrum(
+                        mz_array=np.asarray([600.0], dtype=np.float32),
+                        intensity_array=np.asarray([300.0], dtype=np.float32),
+                        id="controllerType=0 controllerNumber=1 scan=3",
+                        polarity="positive scan",
+                        centroided=True,
+                        scan_start_time=1.0,
+                        params=[
+                            {"ms level": 1},
+                            {"total ion current": 300.0},
+                            {"base peak m/z": 600.0},
+                            {
+                                "name": "base peak intensity",
+                                "value": 300.0,
+                                "unit_accession": "MS:1000131",
+                            },
+                        ],
+                    )
+    return path

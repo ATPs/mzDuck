@@ -14,16 +14,21 @@ class HelpFormatter(argparse.RawDescriptionHelpFormatter, argparse.ArgumentDefau
 
 
 MAIN_DESCRIPTION = """\
-mzDuck stores centroid MS2 mzML data in a DuckDB-backed .mzduck file.
+mzDuck stores centroid mzML spectra in a DuckDB-backed .mzduck file.
 
-It imports one mzML run into one .mzduck file, lets you inspect/query that
-database, and exports semantic MS2 spectra back to MGF or mzML.
+It imports one mzML run into one .mzduck file, stores MS2 MGF content in a
+dedicated mgf table, stores MS1/MS2/MSn details in separate tables when
+requested, and exports semantic spectra back to MGF or mzML.
 """
 
 
 MAIN_EPILOG = """\
 Examples:
   mzduck convert input.mzML -o output.mzduck --overwrite
+  mzduck convert input.withMS1.mzML -o output.mzduck --index-scan
+  mzduck convert input.mzML -o output.mzduck --ms2-mgf-only --start-scan 100 --end-scan 500
+  mzduck convert input.withMS1.mzML -o ms1-only.mzduck --ms1-only
+  mzduck convert input.withMS1.mzML -o ms2-only.mzduck --ms2-only
   mzduck convert mzduck/example_data/tiny.mzML -o /tmp/tiny.mzduck --batch-size 1 --no-sha256
   mzduck inspect /tmp/tiny.mzduck --json
   mzduck export-mgf /tmp/tiny.mzduck -o /tmp/tiny.mgf --overwrite
@@ -45,6 +50,10 @@ mzML precision flags for export-mzml:
   --inten64  write only intensity arrays as 64-bit floats
 
 Defaults:
+  Default convert mode keeps the mgf table, MS2 detail table, MS1 tables when
+  present, MSn tables when present, run_metadata, and spectrum_summary.
+  --ms2-mgf-only keeps only run_metadata and mgf.
+  --index-scan creates an index only on mgf(scan_number).
   mzDuck stores peak arrays in the source dtype where possible.
   mzML export defaults to the stored/source dtype unless precision flags are used.
 """
@@ -63,11 +72,21 @@ def build_parser():
         "convert",
         help="convert mzML to mzDuck",
         formatter_class=HelpFormatter,
-        description="Convert one centroid MS2 mzML file into one .mzduck file.",
+        description="Convert one centroid mzML file into one .mzduck file.",
         epilog="""\
 Examples:
   mzduck convert input.mzML -o output.mzduck --overwrite
+  mzduck convert input.withMS1.mzML -o output.mzduck --index-scan
+  mzduck convert input.mzML -o mgf-only.mzduck --ms2-mgf-only --overwrite
+  mzduck convert input.withMS1.mzML -o no-ms1.mzduck --no-ms1
+  mzduck convert input.withMS1.mzML -o scan-window.mzduck --start-scan 1000 --end-scan 2000
   mzduck convert mzduck/example_data/tiny.mzML /tmp/tiny.mzduck --batch-size 1 --no-sha256
+
+Table modes:
+  default          run_metadata, mgf, ms2_spectra, MS1/MSn tables when present, spectrum_summary
+  --ms2-mgf-only  run_metadata and mgf only
+  --ms2-only      run_metadata, mgf, ms2_spectra, spectrum_summary
+  --ms1-only      run_metadata, ms1_spectra, spectrum_summary
 """,
     )
     convert.add_argument("input_mzml", metavar="input.mzML")
@@ -91,7 +110,43 @@ Examples:
     convert.add_argument(
         "--index-scan-number",
         action="store_true",
-        help="create the optional scan_number index after import",
+        help="deprecated alias for --index-scan",
+    )
+    convert.add_argument(
+        "--index-scan",
+        action="store_true",
+        help="create idx_mgf_scan_number on mgf(scan_number) after import",
+    )
+    mode = convert.add_argument_group("table selection")
+    mode.add_argument(
+        "--ms2-mgf-only",
+        action="store_true",
+        help="only keep run_metadata and the MGF contract table",
+    )
+    mode.add_argument(
+        "--no-ms1",
+        action="store_true",
+        help="skip MS1 spectra in default mode",
+    )
+    mode.add_argument(
+        "--ms2-only",
+        action="store_true",
+        help="keep only MS2 MGF rows, MS2 detail rows, run_metadata, and spectrum_summary",
+    )
+    mode.add_argument(
+        "--ms1-only",
+        action="store_true",
+        help="keep only MS1 spectra, run_metadata, and spectrum_summary",
+    )
+    mode.add_argument(
+        "--start-scan",
+        type=int,
+        help="inclusive lower scan_number bound",
+    )
+    mode.add_argument(
+        "--end-scan",
+        type=int,
+        help="inclusive upper scan_number bound",
     )
 
     export_mgf = subparsers.add_parser(
@@ -206,8 +261,15 @@ def main(argv=None):
                 batch_size=args.batch_size,
                 compression=args.compression,
                 compression_level=args.compression_level,
+                index_scan=args.index_scan,
                 index_scan_number=args.index_scan_number,
                 compute_sha256=not args.no_sha256,
+                ms2_mgf_only=args.ms2_mgf_only,
+                no_ms1=args.no_ms1,
+                ms2_only=args.ms2_only,
+                ms1_only=args.ms1_only,
+                start_scan=args.start_scan,
+                end_scan=args.end_scan,
             )
             handle.close()
             return 0

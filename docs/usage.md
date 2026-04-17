@@ -59,6 +59,39 @@ Expected key values:
 }
 ```
 
+## Table Modes
+
+Default conversion stores:
+
+- `run_metadata`
+- `mgf`
+- `ms2_spectra`
+- `ms1_spectra` when the input has MS1 and MS1 is not disabled
+- higher MSn tables such as `ms3_spectra` when present
+- `spectrum_summary`
+
+Mode examples:
+
+```bash
+# Only run_metadata and the MS2 MGF contract table.
+mzduck convert input.mzML -o /tmp/ms2-mgf-only.mzduck --ms2-mgf-only --overwrite
+
+# Keep MS2 MGF rows and MS2 metadata, skip all other MS levels.
+mzduck convert input.withMS1.mzML -o /tmp/ms2-only.mzduck --ms2-only --overwrite
+
+# Keep only MS1 spectra and MS1 peak arrays.
+mzduck convert input.withMS1.mzML -o /tmp/ms1-only.mzduck --ms1-only --overwrite
+
+# Default mode, but skip MS1 spectra.
+mzduck convert input.withMS1.mzML -o /tmp/no-ms1.mzduck --no-ms1 --overwrite
+
+# Inclusive scan-number subset.
+mzduck convert input.mzML -o /tmp/window.mzduck --start-scan 1000 --end-scan 2000 --overwrite
+
+# Index exact scan-number lookups on the MGF table only.
+mzduck convert input.mzML -o /tmp/indexed.mzduck --index-scan --overwrite
+```
+
 ## Export mzDuck to MGF
 
 ```bash
@@ -108,7 +141,7 @@ with MzDuckFile.open(example_data_path("tiny.mzduck")) as db:
     rows = db.query(
         """
         SELECT scan_number, rt, precursor_mz, precursor_charge
-        FROM spectra
+        FROM mgf
         WHERE precursor_mz BETWEEN ? AND ?
         """,
         [440.0, 450.0],
@@ -122,7 +155,7 @@ Find precursor spectra in a mass window:
 
 ```sql
 SELECT scan_number, rt, precursor_mz, precursor_charge
-FROM spectra
+FROM mgf
 WHERE precursor_mz BETWEEN 440.0 AND 450.0
 ORDER BY rt;
 ```
@@ -130,8 +163,11 @@ ORDER BY rt;
 Get the peaks for one spectrum in source order:
 
 ```sql
-SELECT mz, intensity
-FROM peaks
+SELECT
+  generate_subscripts(mz_array, 1) - 1 AS peak_index,
+  UNNEST(mz_array) AS mz,
+  UNNEST(intensity_array) AS intensity
+FROM mgf
 WHERE scan_number = 1
 ORDER BY peak_index;
 ```
@@ -139,13 +175,25 @@ ORDER BY peak_index;
 Extract a product-ion chromatogram:
 
 ```sql
-SELECT s.rt, SUM(p.intensity) AS xic
-FROM spectra s
-JOIN peaks p ON p.scan_number = s.scan_number
-WHERE p.mz BETWEEN 149.0 AND 151.0
-GROUP BY s.rt
-ORDER BY s.rt;
+SELECT rt, SUM(intensity) AS xic
+FROM (
+  SELECT
+    rt,
+    UNNEST(mz_array) AS mz,
+    UNNEST(intensity_array) AS intensity
+  FROM mgf
+) peaks
+WHERE mz BETWEEN 149.0 AND 151.0
+GROUP BY rt
+ORDER BY rt;
 ```
+
+## Metadata
+
+`run_metadata` stores provenance, mzML header XML fragments, counts by MS level,
+array dtype choices, compression settings, and a JSON `table_registry`. The
+registry is useful for deciding whether a file can export to MGF, whether MS1
+peaks are present, and which table has a scan-number index.
 
 ## Regenerate Example Data
 

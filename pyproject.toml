@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mzduck"
 version = "0.1.0"
-description = "DuckDB-backed storage for centroid MS2 mzML data"
+description = "DuckDB-backed storage for centroid mzML spectra"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {file = "LICENSE"}

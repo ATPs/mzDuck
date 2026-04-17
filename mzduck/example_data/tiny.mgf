@@ -1,5 +1,5 @@
 BEGIN IONS
-TITLE=controllerType=0 controllerNumber=1 scan=1
+TITLE=tiny.1.1.2
 PEPMASS=445.34 1200
 CHARGE=2+
 RTINSECONDS=90
@@ -9,7 +9,7 @@ RTINSECONDS=90
 END IONS
 
 BEGIN IONS
-TITLE=controllerType=0 controllerNumber=1 scan=2
+TITLE=tiny.2.2.3
 PEPMASS=550.2 900
 CHARGE=3+
 RTINSECONDS=120

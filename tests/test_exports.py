@@ -39,7 +39,8 @@ def test_export_mgf(tiny_mzduck, tmp_path):
         db.to_mgf(output)
 
     text = output.read_text()
-    assert "TITLE=controllerType=0 controllerNumber=1 scan=1" in text
+    assert "TITLE=tiny.1.1.2" in text
+    assert "TITLE=tiny.2.2.3" in text
     assert "PEPMASS=445.34 1200" in text
     assert "CHARGE=2+" in text
     assert "RTINSECONDS=90" in text

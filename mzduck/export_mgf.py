@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from .schema import table_exists
+
 
 def rt_to_seconds(value, unit):
     if value is None:
@@ -32,22 +34,23 @@ def ensure_output_path(output_path, *, overwrite=False):
 
 
 def export_mgf(conn, output_path, *, overwrite=False):
+    if not table_exists(conn, "mgf"):
+        raise ValueError("This mzDuck file does not contain an mgf table")
+
     path = ensure_output_path(output_path, overwrite=overwrite)
     metadata = dict(conn.execute("SELECT key, value FROM run_metadata").fetchall())
     rt_unit = metadata.get("rt_unit")
-    native_id_template = metadata.get("native_id_template")
     cursor = conn.execute(
         """
         SELECT
-            scan_number,
-            native_id,
+            title,
             rt,
             precursor_mz,
-            precursor_charge,
             precursor_intensity,
+            precursor_charge,
             mz_array,
             intensity_array
-        FROM spectra
+        FROM mgf
         ORDER BY scan_number
         """
     )
@@ -58,17 +61,15 @@ def export_mgf(conn, output_path, *, overwrite=False):
             if row is None:
                 break
             (
-                scan_number,
-                native_id,
+                title,
                 rt,
                 precursor_mz,
-                precursor_charge,
                 precursor_intensity,
+                precursor_charge,
                 mz_array,
                 intensity_array,
             ) = row
             handle.write("BEGIN IONS\n")
-            title = reconstruct_native_id(native_id, native_id_template, scan_number)
             handle.write(f"TITLE={title}\n")
             if precursor_mz is not None:
                 pepmass = format_float(precursor_mz)
@@ -86,11 +87,3 @@ def export_mgf(conn, output_path, *, overwrite=False):
                 handle.write(f"{format_float(mz)} {format_float(intensity)}\n")
             handle.write("END IONS\n\n")
     return path
-
-
-def reconstruct_native_id(native_id, native_id_template, scan_number):
-    if native_id:
-        return native_id
-    if native_id_template:
-        return native_id_template.format(scan_number=scan_number)
-    return f"scan={scan_number}"

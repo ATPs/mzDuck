@@ -21,3 +21,6 @@ the package in editable mode:
 /data/p/anaconda3/bin/python examples/query_example.py
 /data/p/anaconda3/bin/python examples/convert_example.py --outdir /tmp/mzduck-example
 ```
+
+The bundled `tiny.mzduck` uses the default table layout for an MS2-only file:
+`run_metadata`, `mgf`, `ms2_spectra`, and `spectrum_summary`.

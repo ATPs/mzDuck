@@ -8,6 +8,7 @@ import warnings
 import numpy as np
 
 from .export_mgf import ensure_output_path
+from .schema import msn_levels_present, msn_table_name, table_exists
 
 SHORT_ACTIVATION_TO_TERM = {
     "HCD": "beam-type collision-induced dissociation",
@@ -17,6 +18,35 @@ SHORT_ACTIVATION_TO_TERM = {
     "IRMPD": "infrared multiphoton dissociation",
     "SID": "supplemental collision-induced dissociation",
 }
+
+EXPORT_COLUMNS = [
+    "scan_number",
+    "source_index",
+    "native_id",
+    "ms_level",
+    "rt",
+    "precursor_mz",
+    "precursor_charge",
+    "precursor_intensity",
+    "collision_energy",
+    "activation_type",
+    "isolation_window_target",
+    "isolation_window_lower",
+    "isolation_window_upper",
+    "spectrum_ref",
+    "base_peak_mz",
+    "base_peak_intensity",
+    "tic",
+    "lowest_mz",
+    "highest_mz",
+    "filter_string",
+    "ion_injection_time",
+    "monoisotopic_mz",
+    "scan_window_lower",
+    "scan_window_upper",
+    "mz_array",
+    "intensity_array",
+]
 
 
 def rt_to_minutes(value, unit):
@@ -55,7 +85,9 @@ def export_mzml(
         metadata.get("intensity_array_storage_dtype"),
     )
     run_id = metadata.get("run_id") or "mzduck_run"
-    count = conn.execute("SELECT COUNT(*) FROM spectra").fetchone()[0]
+    count = export_spectrum_count(conn)
+    if count == 0:
+        raise ValueError("This mzDuck file does not contain exportable spectra")
 
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=ReferentialIntegrityWarning)
@@ -67,7 +99,7 @@ def export_mzml(
             ) as writer:
                 writer.register("Software", "mzduck")
                 writer.controlled_vocabularies()
-                writer.file_description(["MSn spectrum"])
+                writer.file_description(file_description_params(conn))
                 writer.software_list(
                     [
                         writer.Software(
@@ -107,18 +139,8 @@ def export_mzml(
                 )
                 with writer.run(id=run_id):
                     with writer.spectrum_list(count=count):
-                        cursor = conn.execute(
-                            "SELECT * FROM spectra ORDER BY scan_number"
-                        )
-                        columns = [item[0] for item in conn.description]
-                        while True:
-                            row = cursor.fetchone()
-                            if row is None:
-                                break
-                            spectrum = dict(zip(columns, row))
-                            mz_array = np.asarray(
-                                spectrum["mz_array"], dtype=mz_dtype
-                            )
+                        for spectrum in iter_export_spectra(conn):
+                            mz_array = np.asarray(spectrum["mz_array"], dtype=mz_dtype)
                             intensity_array = np.asarray(
                                 spectrum["intensity_array"], dtype=intensity_dtype
                             )
@@ -143,6 +165,155 @@ def export_mzml(
                                 scan_window_list=scan_window_list(spectrum),
                             )
     return path
+
+
+def export_spectrum_count(conn):
+    count = 0
+    if table_exists(conn, "ms1_spectra"):
+        count += conn.execute("SELECT COUNT(*) FROM ms1_spectra").fetchone()[0]
+    if table_exists(conn, "mgf"):
+        count += conn.execute("SELECT COUNT(*) FROM mgf").fetchone()[0]
+    for level in msn_levels_present(conn):
+        count += conn.execute(
+            f"SELECT COUNT(*) FROM {msn_table_name(level)}"
+        ).fetchone()[0]
+    return int(count)
+
+
+def file_description_params(conn):
+    params = []
+    if table_exists(conn, "ms1_spectra") and conn.execute(
+        "SELECT COUNT(*) FROM ms1_spectra"
+    ).fetchone()[0]:
+        params.append("MS1 spectrum")
+    if table_exists(conn, "mgf") and conn.execute(
+        "SELECT COUNT(*) FROM mgf"
+    ).fetchone()[0]:
+        params.append("MSn spectrum")
+    for level in msn_levels_present(conn):
+        if conn.execute(f"SELECT COUNT(*) FROM {msn_table_name(level)}").fetchone()[0]:
+            params.append("MSn spectrum")
+            break
+    return params or ["MSn spectrum"]
+
+
+def iter_export_spectra(conn):
+    selects = []
+    if table_exists(conn, "ms1_spectra"):
+        selects.append(
+            """
+            SELECT
+                scan_number,
+                source_index,
+                native_id,
+                ms_level,
+                rt,
+                CAST(NULL AS DOUBLE) AS precursor_mz,
+                CAST(NULL AS TINYINT) AS precursor_charge,
+                CAST(NULL AS FLOAT) AS precursor_intensity,
+                CAST(NULL AS FLOAT) AS collision_energy,
+                CAST(NULL AS VARCHAR) AS activation_type,
+                CAST(NULL AS DOUBLE) AS isolation_window_target,
+                CAST(NULL AS FLOAT) AS isolation_window_lower,
+                CAST(NULL AS FLOAT) AS isolation_window_upper,
+                CAST(NULL AS VARCHAR) AS spectrum_ref,
+                base_peak_mz,
+                base_peak_intensity,
+                tic,
+                lowest_mz,
+                highest_mz,
+                filter_string,
+                ion_injection_time,
+                CAST(NULL AS DOUBLE) AS monoisotopic_mz,
+                scan_window_lower,
+                scan_window_upper,
+                mz_array,
+                intensity_array
+            FROM ms1_spectra
+            """
+        )
+    if table_exists(conn, "mgf"):
+        if table_exists(conn, "ms2_spectra"):
+            selects.append(
+                """
+                SELECT
+                    m.scan_number,
+                    d.source_index,
+                    d.native_id,
+                    2 AS ms_level,
+                    COALESCE(d.rt, m.rt) AS rt,
+                    m.precursor_mz,
+                    m.precursor_charge,
+                    m.precursor_intensity,
+                    d.collision_energy,
+                    d.activation_type,
+                    d.isolation_window_target,
+                    d.isolation_window_lower,
+                    d.isolation_window_upper,
+                    d.spectrum_ref,
+                    d.base_peak_mz,
+                    d.base_peak_intensity,
+                    d.tic,
+                    d.lowest_mz,
+                    d.highest_mz,
+                    d.filter_string,
+                    d.ion_injection_time,
+                    d.monoisotopic_mz,
+                    d.scan_window_lower,
+                    d.scan_window_upper,
+                    m.mz_array,
+                    m.intensity_array
+                FROM mgf m
+                LEFT JOIN ms2_spectra d USING (scan_number)
+                """
+            )
+        else:
+            selects.append(
+                """
+                SELECT
+                    scan_number,
+                    CAST(NULL AS INTEGER) AS source_index,
+                    CAST(NULL AS VARCHAR) AS native_id,
+                    2 AS ms_level,
+                    rt,
+                    precursor_mz,
+                    precursor_charge,
+                    precursor_intensity,
+                    CAST(NULL AS FLOAT) AS collision_energy,
+                    CAST(NULL AS VARCHAR) AS activation_type,
+                    precursor_mz AS isolation_window_target,
+                    CAST(NULL AS FLOAT) AS isolation_window_lower,
+                    CAST(NULL AS FLOAT) AS isolation_window_upper,
+                    CAST(NULL AS VARCHAR) AS spectrum_ref,
+                    CAST(NULL AS FLOAT) AS base_peak_mz,
+                    CAST(NULL AS FLOAT) AS base_peak_intensity,
+                    CAST(NULL AS FLOAT) AS tic,
+                    CAST(NULL AS FLOAT) AS lowest_mz,
+                    CAST(NULL AS FLOAT) AS highest_mz,
+                    CAST(NULL AS VARCHAR) AS filter_string,
+                    CAST(NULL AS FLOAT) AS ion_injection_time,
+                    CAST(NULL AS DOUBLE) AS monoisotopic_mz,
+                    CAST(NULL AS FLOAT) AS scan_window_lower,
+                    CAST(NULL AS FLOAT) AS scan_window_upper,
+                    mz_array,
+                    intensity_array
+                FROM mgf
+                """
+            )
+    for level in msn_levels_present(conn):
+        table_name = msn_table_name(level)
+        selects.append(f"SELECT {', '.join(EXPORT_COLUMNS)} FROM {table_name}")
+
+    if not selects:
+        raise ValueError("This mzDuck file does not contain exportable spectra")
+    sql = "\nUNION ALL\n".join(selects) + "\nORDER BY scan_number"
+    cursor = conn.execute(sql)
+    columns = [item[0] for item in cursor.description]
+    while True:
+        row = cursor.fetchone()
+        if row is None:
+            break
+        yield dict(zip(columns, row))
 
 
 def dtype_for_precision(precision, label, storage_dtype):
@@ -185,7 +356,8 @@ def polarity_param(value):
 
 
 def spectrum_params(spectrum):
-    params = [{"ms level": 2}]
+    ms_level = int(spectrum.get("ms_level") or 2)
+    params = [{"ms level": ms_level}]
     if spectrum.get("tic") is not None:
         params.append({"total ion current": spectrum["tic"]})
     if spectrum.get("base_peak_mz") is not None:
@@ -236,6 +408,8 @@ def scan_window_list(spectrum):
 
 
 def precursor_information(spectrum):
+    if int(spectrum.get("ms_level") or 1) < 2:
+        return None
     precursor_mz = spectrum.get("precursor_mz")
     precursor_intensity = spectrum.get("precursor_intensity")
     precursor_charge = spectrum.get("precursor_charge")
