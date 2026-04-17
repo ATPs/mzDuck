@@ -1,28 +1,73 @@
 # mzDuck
 
-mzDuck is a Python package for storing centroid mzML spectra in a single
-DuckDB database file. It keeps the MGF export content in a narrow `mgf` table,
-stores MS1/MS2/MSn detail tables separately, and records mzML header fragments
-plus table summaries in `run_metadata`.
+mzDuck is a DuckDB-backed container for centroid mzML runs.
 
-The current v1 scope is intentionally focused:
+The v2 layout is designed around two goals that pull in opposite directions:
 
-- input: centroid mzML;
-- storage: one `.mzduck` DuckDB database per source run;
-- output: `.mgf` and `.mzML`;
-- API: Python class plus `mzduck` command-line tool.
+1. keep the file close to mzMLb size in practice;
+2. keep enough information to reconstruct the important mzML fields exactly.
 
-## Repository Contents
+The core idea is to store one canonical MS2 table, derive the public MGF shape
+as a view, hoist repeatable text into run-level templates, keep sparse exact
+fallback rows only when reconstruction is not exact, and finish every write
+with a compact copy into a fresh DuckDB file.
 
-```text
-mzduck/                     Python package
-mzduck/example_data/         tiny bundled mzML, mzDuck, and MGF examples
-examples/                    runnable example scripts
-docs/usage.md                detailed usage guide
-tests/                       pytest suite
-design/20260416design.codex.md
-                             v1 format and package specification
-```
+## What V2 Stores
+
+`schema_version = 2` uses these relations:
+
+- `run_metadata`
+  run-level provenance, original mzML header fragments, templates, encoder
+  choices, counts, ranges, and table registry.
+- `ms1_spectra`
+  physical MS1 spectra and arrays when MS1 is included.
+- `ms2_spectra`
+  canonical physical MS2 spectra and arrays.
+- `mgf`
+  compatibility view derived from `ms2_spectra`. `TITLE` is computed, not
+  stored.
+- `spectrum_text_overrides`
+  sparse exact fallback rows for `native_id`, `spectrum_ref`, and
+  `filter_string`.
+- `spectrum_extra_params`
+  mzML params that do not map to typed columns.
+- `ms3_spectra`, `ms4_spectra`, ...
+  higher MSn tables when present.
+
+There is no physical `spectrum_summary` table in v2. Summary counts live in
+`run_metadata`, and `inspect()` derives the report from metadata plus the
+present tables.
+
+## PRIDE Acceptance Run
+
+Reference data:
+
+- source mzML:
+  `/data2/pub/proteome/PRIDE/protinsight/2019/07/PXD010154/temp/temp/1556259.mzML`
+- reference mzMLb:
+  `/data2/pub/proteome/PRIDE/protinsight/2019/07/PXD010154/temp/temp/1556259.mzMLb`
+
+Observed sizes on 2026-04-17 with the current v2 implementation:
+
+| File | Size |
+| --- | ---: |
+| `1556259.mzML` | 408.44 MiB |
+| `1556259.mzMLb` | 83.26 MiB |
+| old `1556259.mzduck` | 120.01 MiB |
+| v2 `1556259.v2.mzduck` | 90.26 MiB |
+| old `1556259.ms2-mgf-only.mzduck` | 135.01 MiB |
+| v2 `1556259.v2.ms2-mgf-only.mzduck` | 90.26 MiB |
+
+For this PRIDE run, v2 validated:
+
+- exact scan order recovery;
+- exact `native_id` recovery;
+- exact `spectrumRef` recovery;
+- exact Thermo `filter string` recovery;
+- exact per-scan `instrumentConfigurationRef` recovery.
+
+The PRIDE file now lands much closer to mzMLb while preserving the important
+MS2 fields exactly.
 
 ## Installation
 
@@ -32,102 +77,61 @@ From this repository:
 /data/p/anaconda3/bin/python -m pip install -e .
 ```
 
-Check that the CLI is available:
+Top-level imports remain stable:
 
-```bash
-mzduck --help
+```python
+from mzduck import MzDuckFile, from_mzml, open, to_mgf, to_mzml
 ```
 
-## Bundled Example Data
+## Command Line
 
-The package includes a tiny two-spectrum example set:
-
-```text
-mzduck/example_data/tiny.mzML
-mzduck/example_data/tiny.mzduck
-mzduck/example_data/tiny.mgf
-```
-
-The tiny mzML file has two centroid MS2 spectra and five total peaks. It is
-useful for smoke tests, docs, and quick manual inspection.
-
-Regenerate the example data with:
+Detailed landing help:
 
 ```bash
-/data/p/anaconda3/bin/python examples/make_example_data.py
+/data/p/anaconda3/bin/python -m mzduck --help
 ```
 
-## Command-Line Quick Start
-
-Convert mzML to mzDuck:
+Focused convert help:
 
 ```bash
-mzduck convert \
+/data/p/anaconda3/bin/python -m mzduck convert --help
+```
+
+Quick examples:
+
+```bash
+/data/p/anaconda3/bin/python -m mzduck convert \
   mzduck/example_data/tiny.mzML \
   -o /tmp/tiny.mzduck \
   --overwrite \
-  --no-sha256 \
-  --compression zstd
+  --no-sha256
+
+/data/p/anaconda3/bin/python -m mzduck inspect /tmp/tiny.mzduck --json
+
+/data/p/anaconda3/bin/python -m mzduck export-mgf /tmp/tiny.mzduck -o /tmp/tiny.mgf --overwrite
+
+/data/p/anaconda3/bin/python -m mzduck export-mzml /tmp/tiny.mzduck -o /tmp/tiny.roundtrip.mzML --overwrite
 ```
 
-Convert only the MGF-relevant MS2 data:
+MS level selection:
 
 ```bash
-mzduck convert input.mzML -o /tmp/ms2-mgf-only.mzduck --ms2-mgf-only --overwrite
+/data/p/anaconda3/bin/python -m mzduck convert input.mzML -o out.mzduck --ms2-mgf-only
+/data/p/anaconda3/bin/python -m mzduck convert input.mzML -o out.mzduck --ms2-only
+/data/p/anaconda3/bin/python -m mzduck convert input.withMS1.mzML -o out.mzduck --ms1-only
+/data/p/anaconda3/bin/python -m mzduck convert input.withMS1.mzML -o out.mzduck --no-ms1
 ```
 
-Convert a scan window or select MS levels:
+Precision control for mzML export:
 
 ```bash
-mzduck convert input.withMS1.mzML -o /tmp/window.mzduck --start-scan 1000 --end-scan 2000
-mzduck convert input.withMS1.mzML -o /tmp/ms1-only.mzduck --ms1-only
-mzduck convert input.withMS1.mzML -o /tmp/ms2-only.mzduck --ms2-only
-mzduck convert input.withMS1.mzML -o /tmp/no-ms1.mzduck --no-ms1
+/data/p/anaconda3/bin/python -m mzduck export-mzml in.mzduck -o out.mzML --32 --overwrite
+/data/p/anaconda3/bin/python -m mzduck export-mzml in.mzduck -o out.mzML --mz64 --inten32 --overwrite
 ```
 
-Create the optional scan lookup index. The index is only created on
-`mgf(scan_number)`:
+## Python Usage
 
-```bash
-mzduck convert input.mzML -o /tmp/indexed.mzduck --index-scan --overwrite
-```
-
-Inspect the mzDuck file:
-
-```bash
-mzduck inspect /tmp/tiny.mzduck --json
-```
-
-Export MGF:
-
-```bash
-mzduck export-mgf /tmp/tiny.mzduck -o /tmp/tiny.mgf --overwrite
-```
-
-Export mzML:
-
-```bash
-mzduck export-mzml /tmp/tiny.mzduck -o /tmp/tiny.roundtrip.mzML --overwrite
-```
-
-Control mzML binary array precision:
-
-```bash
-# Both arrays as 32-bit floats.
-mzduck export-mzml /tmp/tiny.mzduck -o /tmp/tiny.32.mzML --32 --overwrite
-
-# Per-array control.
-mzduck export-mzml /tmp/tiny.mzduck -o /tmp/tiny.mz64-int32.mzML --mz64 --inten32 --overwrite
-
-# Mixed precision is allowed.
-mzduck export-mzml /tmp/tiny.mzduck -o /tmp/tiny.mz32-int64.mzML --mz32 --inten64 --overwrite
-```
-
-Commands that write files accept either a positional output path or `-o/--out`.
-For example, `mzduck convert input.mzML output.mzduck` and
-`mzduck convert input.mzML -o output.mzduck` are equivalent.
-
-## Python Quick Start
+Create a new file:
 
 ```python
 from mzduck import MzDuckFile
@@ -136,59 +140,151 @@ db = MzDuckFile.from_mzml(
     "mzduck/example_data/tiny.mzML",
     "/tmp/tiny.mzduck",
     overwrite=True,
-    batch_size=1,
     compute_sha256=False,
 )
 
 try:
     print(db.inspect())
-
-    spectrum = db.get_spectrum(1)
+    spectrum = db.get_spectrum(2)
+    print(spectrum["title"])
     print(spectrum["native_id"])
+    print(spectrum["spectrum_ref"])
+    print(spectrum["filter_string"])
     print(spectrum["mz"])
     print(spectrum["intensity"])
-
-    rows = db.query(
-        """
-        SELECT scan_number, rt, precursor_mz, precursor_charge
-        FROM mgf
-        WHERE precursor_mz BETWEEN ? AND ?
-        ORDER BY rt
-        """,
-        [440.0, 450.0],
-    ).fetchall()
-    print(rows)
-
-    db.to_mgf("/tmp/tiny.mgf", overwrite=True)
-    db.to_mzml("/tmp/tiny.roundtrip.mzML", overwrite=True)
 finally:
     db.close()
 ```
 
-Open an existing file read-only:
+Open an existing file:
 
 ```python
 from mzduck import MzDuckFile, example_data_path
 
 with MzDuckFile.open(example_data_path("tiny.mzduck")) as db:
-    print(db.get_spectrum(1))
+    print(db.metadata()["schema_version"])
+    print(db.get_spectrum(1)["title"])
 ```
+
+Top-level convenience functions:
+
+```python
+from mzduck import from_mzml, open, to_mgf, to_mzml
+
+from_mzml("input.mzML", "output.mzduck", overwrite=True, compute_sha256=False)
+to_mgf("output.mzduck", "output.mgf")
+to_mzml("output.mzduck", "output.mzML")
+```
+
+## Reconstruction Policy
+
+The public API and export code reconstruct several fields instead of storing
+them redundantly.
+
+### MGF title
+
+`mgf.title` is always derived from:
+
+```text
+{mgf_title_source}.{scan_number}.{scan_number}.{precursor_charge}
+```
+
+The title stays publicly queryable through the `mgf` view and Python API, but
+it is not physically stored in v2.
+
+### `native_id`
+
+If every selected spectrum matches one exact run-level template such as:
+
+```text
+controllerType=0 controllerNumber=1 scan={scan_number}
+```
+
+then the template is stored once in `run_metadata` and no per-row text is kept.
+If any row does not match, only those rows go into `spectrum_text_overrides`.
+
+### `spectrum_ref`
+
+If every selected precursor reference matches one exact template such as:
+
+```text
+controllerType=0 controllerNumber=1 scan={precursor_scan_number}
+```
+
+then the template is stored once in `run_metadata`. Otherwise, exact raw values
+go into `spectrum_text_overrides`.
+
+### Filter strings
+
+Filter-string reconstruction is run-specific, not a global Thermo assumption.
+
+- mzDuck keeps a registry of encoder candidates.
+- A candidate is accepted only if it reproduces every selected row exactly.
+- The accepted encoder id is stored in `run_metadata`, for example
+  `thermo_ms2_v1`.
+- If no candidate matches the whole run exactly, mzDuck sets
+  `filter_string_encoding = raw` and stores the original strings.
+- Sparse per-row overrides remain possible even when a run-level encoder exists.
+
+### Extra mzML params
+
+Anything that is not mapped to a typed field is kept in
+`spectrum_extra_params` instead of being dropped.
+
+In the PRIDE acceptance run, the only repeated non-typed field was a
+scan-level `instrumentConfigurationRef`. That field is now stored as a typed
+column instead of inflating `spectrum_extra_params`.
+
+## Compaction
+
+DuckDB `VACUUM` was not enough to reach the target size on the PRIDE run.
+The v2 writer therefore always uses this flow:
+
+1. write the import into a staging DuckDB file;
+2. validate the staging schema;
+3. copy into a fresh database with `COPY FROM DATABASE`;
+4. validate the compacted file;
+5. atomically rename the compacted file into place.
+
+This compact-copy step is part of normal v2 output, not an optional cleanup.
 
 ## SQL Examples
 
-Find precursor spectra in a mass window:
-
-```sql
-SELECT scan_number, rt, precursor_mz, precursor_charge
-FROM mgf
-WHERE precursor_mz BETWEEN 440.0 AND 450.0
-ORDER BY rt;
-```
-
-Get peaks for one spectrum in source order:
+### Canonical MS2 table
 
 ```sql
 SELECT
+  scan_number,
+  source_index,
+  rt,
+  precursor_mz,
+  precursor_charge,
+  collision_energy,
+  activation_type
+FROM ms2_spectra
+ORDER BY source_index
+LIMIT 10;
+```
+
+### Public MGF compatibility view
+
+```sql
+SELECT
+  scan_number,
+  title,
+  rt,
+  precursor_mz,
+  precursor_charge
+FROM mgf
+ORDER BY scan_number
+LIMIT 10;
+```
+
+### Peak extraction from the MGF view
+
+```sql
+SELECT
+  scan_number,
   generate_subscripts(mz_array, 1) - 1 AS peak_index,
   UNNEST(mz_array) AS mz,
   UNNEST(intensity_array) AS intensity
@@ -197,7 +293,7 @@ WHERE scan_number = 1
 ORDER BY peak_index;
 ```
 
-Extract a product-ion chromatogram:
+### Product-ion chromatogram
 
 ```sql
 SELECT rt, SUM(intensity) AS xic
@@ -213,45 +309,93 @@ GROUP BY rt
 ORDER BY rt;
 ```
 
-## Example Scripts
+### Exact fallback rows
 
-Run the query example:
-
-```bash
-/data/p/anaconda3/bin/python examples/query_example.py
+```sql
+SELECT scan_number, field_name, value
+FROM spectrum_text_overrides
+ORDER BY scan_number, field_name;
 ```
 
-Run a full conversion/export workflow:
+### Additional mzML params not covered by typed columns
 
-```bash
-/data/p/anaconda3/bin/python examples/convert_example.py --outdir /tmp/mzduck-example
+```sql
+SELECT scan_number, scope, name, value
+FROM spectrum_extra_params
+ORDER BY scan_number, scope, ordinal;
 ```
 
-## Schema Summary
+## Large-File Validation Commands
 
-The v1 database always has `run_metadata` plus the selected data tables:
+Full PRIDE conversion:
 
-- `run_metadata`: schema version, provenance, mzML header XML fragments,
-  source counts, included counts, dtype/compression settings, and a JSON
-  `table_registry` describing every table in the DuckDB file.
-- `mgf`: one row per exported MS2 MGF block. It stores only MGF content:
-  `title`, `rt`, precursor fields, and peak arrays.
-- `ms2_spectra`: non-MGF MS2 metadata used for richer mzML export, including
-  native id, activation, collision energy, isolation window, scan windows, TIC,
-  base peak, and filter string.
-- `ms1_spectra`: MS1 metadata plus MS1 peak arrays when MS1 is included.
-- `msN_spectra`: separate higher-level tables such as `ms3_spectra` when MSn
-  spectra are present in default mode.
-- `spectrum_summary`: one row per included spectrum in all modes except
-  `--ms2-mgf-only`.
+```bash
+/data/p/anaconda3/bin/python -m mzduck convert \
+  /data2/pub/proteome/PRIDE/protinsight/2019/07/PXD010154/temp/temp/1556259.mzML \
+  -o /data2/pub/proteome/PRIDE/protinsight/2019/07/PXD010154/temp/temp/1556259.v2.mzduck \
+  --overwrite \
+  --no-sha256
+```
 
-The schema creates no secondary indexes by default. Use
-`mzduck convert --index-scan` when repeated exact scan-number lookups need an
-ART index on `mgf(scan_number)`.
+MS2-only compact conversion:
 
-See `design/20260416design.codex.md` for the complete v1 specification.
+```bash
+/data/p/anaconda3/bin/python -m mzduck convert \
+  /data2/pub/proteome/PRIDE/protinsight/2019/07/PXD010154/temp/temp/1556259.mzML \
+  -o /data2/pub/proteome/PRIDE/protinsight/2019/07/PXD010154/temp/temp/1556259.v2.ms2-mgf-only.mzduck \
+  --overwrite \
+  --no-sha256 \
+  --ms2-mgf-only
+```
 
-## Development Tests
+Inspect the result:
+
+```bash
+/data/p/anaconda3/bin/python -m mzduck inspect \
+  /data2/pub/proteome/PRIDE/protinsight/2019/07/PXD010154/temp/temp/1556259.v2.mzduck \
+  --json
+```
+
+One exact-recovery validation pass:
+
+```bash
+/data/p/anaconda3/bin/python - <<'PY'
+from pyteomics import mzml
+from mzduck import MzDuckFile
+from mzduck.export_mzml import iter_export_spectra, load_extra_params, load_text_overrides
+from mzduck.metadata import parse_scan_number
+
+source_path = "/data2/pub/proteome/PRIDE/protinsight/2019/07/PXD010154/temp/temp/1556259.mzML"
+db_path = "/data2/pub/proteome/PRIDE/protinsight/2019/07/PXD010154/temp/temp/1556259.v2.mzduck"
+
+with MzDuckFile.open(db_path, read_only=True) as db:
+    metadata = db.metadata()
+    rebuilt = iter_export_spectra(
+        db.conn,
+        metadata=metadata,
+        text_overrides=load_text_overrides(db.conn),
+        extra_params=load_extra_params(db.conn),
+    )
+    mismatches = 0
+    with mzml.MzML(source_path) as reader:
+        for source_spectrum in reader:
+            rebuilt_spectrum = next(rebuilt)
+            source_scan = source_spectrum["scanList"]["scan"][0]
+            source_precursor = source_spectrum["precursorList"]["precursor"][0]
+            checks = [
+                rebuilt_spectrum["scan_number"] == parse_scan_number(source_spectrum["id"]),
+                rebuilt_spectrum["spectrum_ref"] == source_precursor.get("spectrumRef"),
+                rebuilt_spectrum["filter_string"] == source_scan.get("filter string"),
+                rebuilt_spectrum["instrument_configuration_ref"] == source_scan.get("instrumentConfigurationRef"),
+            ]
+            if not all(checks):
+                mismatches += 1
+                break
+    print({"mismatches": mismatches})
+PY
+```
+
+## Tests
 
 Run the test suite:
 
@@ -259,13 +403,13 @@ Run the test suite:
 /data/p/anaconda3/bin/python -m pytest -q
 ```
 
-The tests generate a tiny mzML fixture, convert it to mzDuck, export MGF/mzML,
-and validate round-trip parsing.
+The fast regression set covers:
 
-## Notes
-
-- mzML export uses `psims`.
-- v1 mzML round-trip means semantic equivalence for supported fields, not
-  byte-identical XML.
-- The full-size validation fixture from the design is much larger and is not
-  bundled with the package.
+- v2 schema validation;
+- `mgf` compatibility view behavior;
+- absence of physical `spectrum_summary`;
+- `get_spectrum()`, `export_mgf()`, and `export_mzml()`;
+- top-level package imports;
+- detailed top-level CLI help;
+- exact filter-string encoder detection and raw fallback;
+- mzML header restoration and scan-level instrument configuration export.

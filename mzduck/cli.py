@@ -16,13 +16,49 @@ class HelpFormatter(argparse.RawDescriptionHelpFormatter, argparse.ArgumentDefau
 MAIN_DESCRIPTION = """\
 mzDuck stores centroid mzML spectra in a DuckDB-backed .mzduck file.
 
-It imports one mzML run into one .mzduck file, stores MS2 MGF content in a
-dedicated mgf table, stores MS1/MS2/MSn details in separate tables when
-requested, and exports semantic spectra back to MGF or mzML.
+The v2 layout keeps one canonical MS2 storage table, exposes an MGF
+compatibility view for SQL and export, stores sparse exact text fallbacks when
+reconstruction is not trustworthy, and writes the final database through a
+fresh-file compact-copy step so the on-disk file stays small.
 """
 
 
 MAIN_EPILOG = """\
+Layout:
+  run_metadata
+    run-level provenance, header fragments, templates, filter-string policy,
+    counts, and table registry.
+  ms1_spectra
+    physical MS1 spectra plus arrays when MS1 is included.
+  ms2_spectra
+    canonical physical MS2 spectra plus arrays. This is the v2 storage anchor.
+  mgf
+    derived compatibility view with computed TITLE values. It is queryable and
+    exportable, but it is not physically stored in v2.
+  spectrum_text_overrides
+    sparse exact text fallbacks for native_id, spectrum_ref, and filter_string.
+  spectrum_extra_params
+    mzML params not covered by typed columns, grouped by scope.
+
+Reconstructed vs stored fields:
+  TITLE is always derived from run metadata plus scan_number/charge.
+  native_id and spectrum_ref use run-level templates when exact; otherwise
+  mzDuck stores only the original rows that need exact fallback.
+  filter_string uses per-run encoder detection. An encoder is accepted only
+  when it reproduces every selected spectrum exactly. If not, mzDuck stores the
+  original strings instead of inventing an approximate rule.
+
+Compaction:
+  mzDuck writes to a staging DuckDB file and then copies the database into a
+  fresh final file. This avoids carrying free blocks from the first write and
+  is part of the normal v2 output path.
+
+Round-trip scope:
+  mzDuck targets semantic round-trip for supported centroid mzML content.
+  Exported mzML is not expected to be byte-identical XML, but typed fields,
+  templates, exact text overrides, and stored extra params are used to keep the
+  reconstructed spectra faithful to the source run.
+
 Examples:
   mzduck convert input.mzML -o output.mzduck --overwrite
   mzduck convert input.withMS1.mzML -o output.mzduck --index-scan
@@ -50,10 +86,13 @@ mzML precision flags for export-mzml:
   --inten64  write only intensity arrays as 64-bit floats
 
 Defaults:
-  Default convert mode keeps the mgf table, MS2 detail table, MS1 tables when
-  present, MSn tables when present, run_metadata, and spectrum_summary.
-  --ms2-mgf-only keeps only run_metadata and mgf.
-  --index-scan creates an index only on mgf(scan_number).
+  Default convert mode keeps canonical MS2 storage, MS1 when present, MSn when
+  present, run_metadata, and the v2 fallback tables.
+  In v2, --ms2-mgf-only and --ms2-only both produce an MS2-only compact file.
+  The difference is mainly user intent and metadata; the old physical mgf-only
+  split no longer exists because mgf is derived from canonical MS2 storage.
+  --index-scan creates idx_mgf_scan_number on the canonical MS2 table so exact
+  scan lookups through the mgf compatibility view stay fast.
   mzDuck stores peak arrays in the source dtype where possible.
   mzML export defaults to the stored/source dtype unless precision flags are used.
 """
@@ -83,10 +122,12 @@ Examples:
   mzduck convert mzduck/example_data/tiny.mzML /tmp/tiny.mzduck --batch-size 1 --no-sha256
 
 Table modes:
-  default          run_metadata, mgf, ms2_spectra, MS1/MSn tables when present, spectrum_summary
-  --ms2-mgf-only  run_metadata and mgf only
-  --ms2-only      run_metadata, mgf, ms2_spectra, spectrum_summary
-  --ms1-only      run_metadata, ms1_spectra, spectrum_summary
+  default         run_metadata, canonical ms2_spectra, derived mgf view,
+                  MS1 when present, and MSn tables when present
+  --ms2-mgf-only  MS2-only compact v2 file; mgf remains a derived view
+  --ms2-only      MS2-only compact v2 file; equivalent storage shape to
+                  --ms2-mgf-only in v2
+  --ms1-only      run_metadata plus ms1_spectra only
 """,
     )
     convert.add_argument("input_mzml", metavar="input.mzML")
@@ -115,13 +156,13 @@ Table modes:
     convert.add_argument(
         "--index-scan",
         action="store_true",
-        help="create idx_mgf_scan_number on mgf(scan_number) after import",
+        help="create idx_mgf_scan_number on canonical ms2_spectra(scan_number)",
     )
     mode = convert.add_argument_group("table selection")
     mode.add_argument(
         "--ms2-mgf-only",
         action="store_true",
-        help="only keep run_metadata and the MGF contract table",
+        help="build an MS2-only compact v2 file with a derived mgf view",
     )
     mode.add_argument(
         "--no-ms1",
@@ -131,12 +172,12 @@ Table modes:
     mode.add_argument(
         "--ms2-only",
         action="store_true",
-        help="keep only MS2 MGF rows, MS2 detail rows, run_metadata, and spectrum_summary",
+        help="build an MS2-only compact v2 file with canonical ms2_spectra storage",
     )
     mode.add_argument(
         "--ms1-only",
         action="store_true",
-        help="keep only MS1 spectra, run_metadata, and spectrum_summary",
+        help="keep only MS1 spectra and run_metadata",
     )
     mode.add_argument(
         "--start-scan",
@@ -153,11 +194,18 @@ Table modes:
         "export-mgf",
         help="export mzDuck to MGF",
         formatter_class=HelpFormatter,
-        description="Export spectra from a .mzduck file to Mascot Generic Format.",
+        description=(
+            "Export spectra from a .mzduck file to Mascot Generic Format using "
+            "the public mgf compatibility view."
+        ),
         epilog="""\
 Examples:
   mzduck export-mgf input.mzduck -o output.mgf --overwrite
   mzduck export-mgf mzduck/example_data/tiny.mzduck /tmp/tiny.mgf
+
+Notes:
+  In v2 the mgf relation is a derived view, not a stored base table.
+  TITLE values are reconstructed from run metadata and scan_number/charge.
 """,
     )
     export_mgf.add_argument("input_mzduck", metavar="input.mzduck")
@@ -169,13 +217,21 @@ Examples:
         "export-mzml",
         help="export mzDuck to mzML",
         formatter_class=HelpFormatter,
-        description="Export spectra from a .mzduck file to semantic mzML with psims.",
+        description=(
+            "Export spectra from a .mzduck file to semantic mzML with psims, "
+            "using typed columns plus exact fallback metadata when needed."
+        ),
         epilog="""\
 Examples:
   mzduck export-mzml input.mzduck -o output.mzML --overwrite
   mzduck export-mzml input.mzduck -o output.float32.mzML --32
   mzduck export-mzml input.mzduck -o output.mz64-int32.mzML --mz64 --inten32
   mzduck export-mzml input.mzduck -o output.mz32-int64.mzML --mz32 --inten64
+
+Notes:
+  native_id, spectrum_ref, and filter_string may be reconstructed from
+  templates/encoders or taken from exact stored overrides when no exact rule
+  exists for that file.
 """,
     )
     export_mzml.add_argument("input_mzduck", metavar="input.mzduck")
@@ -188,11 +244,19 @@ Examples:
         "inspect",
         help="summarize an mzDuck file",
         formatter_class=HelpFormatter,
-        description="Print counts, ranges, metadata, and precursor summaries for a .mzduck file.",
+        description=(
+            "Print counts, ranges, storage metadata, reconstruction policy, and "
+            "table registry details for a .mzduck file."
+        ),
         epilog="""\
 Examples:
   mzduck inspect input.mzduck
   mzduck inspect input.mzduck --json
+
+Notes:
+  v2 stores summary counts in run_metadata instead of a physical
+  spectrum_summary table. The inspect command reports the derived view of the
+  file layout regardless of storage version.
 """,
     )
     inspect.add_argument("input_mzduck", metavar="input.mzduck")

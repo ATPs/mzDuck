@@ -9,9 +9,19 @@ import duckdb
 import numpy as np
 
 from .export_mgf import export_mgf
-from .export_mzml import export_mzml
+from .export_mzml import export_mzml, v2_ms2_storage
 from .import_mzml import convert_mzml_to_mzduck
-from .schema import msn_levels_present, msn_table_name, table_exists, validate_required_schema
+from .reconstruction import (
+    mgf_title_for_scan,
+    promote_structural_scan_fields,
+    reconstruct_text_field,
+)
+from .schema import (
+    msn_levels_present,
+    msn_table_name,
+    table_exists,
+    validate_required_schema,
+)
 
 
 class MzDuckFile:
@@ -75,7 +85,7 @@ class MzDuckFile:
         return cls(db_path, conn, read_only=read_only)
 
     def to_mgf(self, output_path, *, overwrite=False):
-        """Export the stored MGF contract table to MGF format."""
+        """Export the stored MGF compatibility contract to MGF format."""
         return export_mgf(self.conn, output_path, overwrite=overwrite)
 
     def to_mzml(
@@ -99,25 +109,50 @@ class MzDuckFile:
         """Get one spectrum by mzML scan number."""
         scan_number = int(scan_number)
         meta = self.metadata()
-
-        if table_exists(self.conn, "mgf"):
-            result = self._get_ms2_spectrum(scan_number)
+        is_v2_ms2 = v2_ms2_storage(self.conn)
+        if is_v2_ms2:
+            result = self._fetch_one("ms2_spectra", scan_number)
             if result is not None:
-                return finalize_spectrum(result, meta)
+                return finalize_spectrum(
+                    result,
+                    meta,
+                    overrides=self._text_overrides(scan_number),
+                    extra_params=self._extra_params(scan_number),
+                )
+
+        if table_exists(self.conn, "mgf") and not is_v2_ms2:
+            result = self._get_ms2_spectrum_v1(scan_number)
+            if result is not None:
+                return finalize_spectrum(
+                    result,
+                    meta,
+                    overrides=self._text_overrides(scan_number),
+                    extra_params=self._extra_params(scan_number),
+                )
 
         if table_exists(self.conn, "ms1_spectra"):
             result = self._fetch_one("ms1_spectra", scan_number)
             if result is not None:
-                return finalize_spectrum(result, meta)
+                return finalize_spectrum(
+                    result,
+                    meta,
+                    overrides=self._text_overrides(scan_number),
+                    extra_params=self._extra_params(scan_number),
+                )
 
         for level in msn_levels_present(self.conn):
             result = self._fetch_one(msn_table_name(level), scan_number)
             if result is not None:
-                return finalize_spectrum(result, meta)
+                return finalize_spectrum(
+                    result,
+                    meta,
+                    overrides=self._text_overrides(scan_number),
+                    extra_params=self._extra_params(scan_number),
+                )
 
         raise KeyError(f"No spectrum with scan_number={scan_number}")
 
-    def _get_ms2_spectrum(self, scan_number):
+    def _get_ms2_spectrum_v1(self, scan_number):
         if table_exists(self.conn, "ms2_spectra"):
             cursor = self.conn.execute(
                 """
@@ -137,6 +172,7 @@ class MzDuckFile:
                     d.isolation_window_lower,
                     d.isolation_window_upper,
                     d.spectrum_ref,
+                    CAST(NULL AS INTEGER) AS precursor_scan_number,
                     d.base_peak_mz,
                     d.base_peak_intensity,
                     d.tic,
@@ -174,6 +210,7 @@ class MzDuckFile:
                     CAST(NULL AS FLOAT) AS isolation_window_lower,
                     CAST(NULL AS FLOAT) AS isolation_window_upper,
                     CAST(NULL AS VARCHAR) AS spectrum_ref,
+                    CAST(NULL AS INTEGER) AS precursor_scan_number,
                     CAST(NULL AS FLOAT) AS base_peak_mz,
                     CAST(NULL AS FLOAT) AS base_peak_intensity,
                     CAST(NULL AS FLOAT) AS tic,
@@ -207,6 +244,56 @@ class MzDuckFile:
             return None
         columns = [item[0] for item in cursor.description]
         return dict(zip(columns, row))
+
+    def _text_overrides(self, scan_number):
+        if not table_exists(self.conn, "spectrum_text_overrides"):
+            return {}
+        rows = self.conn.execute(
+            """
+            SELECT field_name, value
+            FROM spectrum_text_overrides
+            WHERE scan_number = ?
+            ORDER BY field_name
+            """,
+            [scan_number],
+        ).fetchall()
+        return {field_name: value for field_name, value in rows}
+
+    def _extra_params(self, scan_number):
+        if not table_exists(self.conn, "spectrum_extra_params"):
+            return {}
+        rows = self.conn.execute(
+            """
+            SELECT
+                scope,
+                ordinal,
+                accession,
+                name,
+                value,
+                unit_accession,
+                unit_name,
+                cv_ref
+            FROM spectrum_extra_params
+            WHERE scan_number = ?
+            ORDER BY scope, ordinal
+            """,
+            [scan_number],
+        ).fetchall()
+        result = {}
+        for scope, ordinal, accession, name, value, unit_accession, unit_name, cv_ref in rows:
+            result.setdefault(scope, []).append(
+                {
+                    "scope": scope,
+                    "ordinal": ordinal,
+                    "accession": accession,
+                    "name": name,
+                    "value": value,
+                    "unit_accession": unit_accession,
+                    "unit_name": unit_name,
+                    "cv_ref": cv_ref,
+                }
+            )
+        return result
 
     def query(self, sql, parameters=None):
         """Run arbitrary SQL against the database."""
@@ -265,6 +352,8 @@ class MzDuckFile:
             "centroided": meta.get("centroided"),
             "ion_injection_time_unit": meta.get("ion_injection_time_unit"),
             "native_id_template": meta.get("native_id_template"),
+            "spectrum_ref_template": meta.get("spectrum_ref_template"),
+            "filter_string_encoding": meta.get("filter_string_encoding"),
             "mgf_title_template": meta.get("mgf_title_template"),
             "compression": meta.get("compression"),
             "compression_level": meta.get("compression_level"),
@@ -278,20 +367,22 @@ class MzDuckFile:
         }
 
     def _scan_and_rt_ranges(self):
-        if table_exists(self.conn, "spectrum_summary"):
-            row = self.conn.execute(
-                "SELECT MIN(scan_number), MAX(scan_number), MIN(rt), MAX(rt) FROM spectrum_summary"
-            ).fetchone()
+        selects = []
+        if table_exists(self.conn, "ms1_spectra"):
+            selects.append("SELECT scan_number, rt FROM ms1_spectra")
+        if v2_ms2_storage(self.conn):
+            selects.append("SELECT scan_number, rt FROM ms2_spectra")
         elif table_exists(self.conn, "mgf"):
-            row = self.conn.execute(
-                "SELECT MIN(scan_number), MAX(scan_number), MIN(rt), MAX(rt) FROM mgf"
-            ).fetchone()
-        elif table_exists(self.conn, "ms1_spectra"):
-            row = self.conn.execute(
-                "SELECT MIN(scan_number), MAX(scan_number), MIN(rt), MAX(rt) FROM ms1_spectra"
-            ).fetchone()
-        else:
+            selects.append("SELECT scan_number, rt FROM mgf")
+        for level in msn_levels_present(self.conn):
+            selects.append(f"SELECT scan_number, rt FROM {msn_table_name(level)}")
+        if not selects:
             return [None, None], [None, None]
+        row = self.conn.execute(
+            "SELECT MIN(scan_number), MAX(scan_number), MIN(rt), MAX(rt) FROM ("
+            + "\nUNION ALL\n".join(selects)
+            + "\n) all_spectra"
+        ).fetchone()
         return [row[0], row[1]], [row[2], row[3]]
 
     def close(self):
@@ -306,13 +397,36 @@ class MzDuckFile:
         return False
 
 
-def finalize_spectrum(result, metadata):
+def finalize_spectrum(result, metadata, *, overrides=None, extra_params=None):
     result = dict(result)
-    result["native_id"] = reconstruct_native_id(result, metadata)
+    overrides = overrides or {}
+    result["title"] = result.get("title") or mgf_title_for_scan(
+        metadata, result["scan_number"], result.get("precursor_charge")
+    )
+    result["native_id"] = result.get("native_id") or reconstruct_text_field(
+        "native_id", result, metadata, override=overrides.get("native_id")
+    )
+    if result.get("spectrum_ref") is None:
+        result["spectrum_ref"] = reconstruct_text_field(
+            "spectrum_ref",
+            result,
+            metadata,
+            override=overrides.get("spectrum_ref"),
+        )
+    if result.get("filter_string") is None:
+        result["filter_string"] = reconstruct_text_field(
+            "filter_string",
+            result,
+            metadata,
+            override=overrides.get("filter_string"),
+        )
     result["rt_unit"] = metadata.get("rt_unit")
     result["polarity"] = metadata.get("polarity") or None
     result["centroided"] = str(metadata.get("centroided", "")).lower() == "true"
     result["ion_injection_time_unit"] = metadata.get("ion_injection_time_unit")
+    if extra_params:
+        result["extra_params"] = extra_params
+        promote_structural_scan_fields(result)
     if "mz_array" in result:
         result["mz"] = np.asarray(
             result["mz_array"],
@@ -324,16 +438,6 @@ def finalize_spectrum(result, metadata):
             dtype=numpy_dtype_for_storage(metadata.get("intensity_array_storage_dtype")),
         )
     return result
-
-
-def reconstruct_native_id(row, metadata):
-    native_id = row.get("native_id")
-    if native_id:
-        return native_id
-    template = metadata.get("native_id_template")
-    if template:
-        return template.format(scan_number=row["scan_number"])
-    return f"scan={row['scan_number']}"
 
 
 def numpy_dtype_for_storage(storage_dtype):

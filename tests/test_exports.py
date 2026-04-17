@@ -61,6 +61,18 @@ def test_export_mzml_is_parseable(tiny_mzduck, tmp_path):
     assert spectra[0]["scanList"]["scan"][0]["scan start time"] == 1.5
     assert list(spectra[1]["m/z array"]) == [300.0, 250.0]
 
+    tree = etree.parse(str(output))
+    assert tree.xpath("string(//mz:software/@id)", namespaces=NS) == "mzduck-test"
+    assert (
+        tree.xpath("string(//mz:dataProcessing/@id)", namespaces=NS)
+        == "mzduck-test-processing"
+    )
+    assert (
+        tree.xpath("string(//mz:spectrumList/@defaultDataProcessingRef)", namespaces=NS)
+        == "mzduck-test-processing"
+    )
+    assert tree.xpath("//mz:scan/@instrumentConfigurationRef", namespaces=NS) == ["IC2"]
+
 
 def test_export_mzml_precision_flags(tiny_mzduck, tmp_path):
     output = tmp_path / "roundtrip-precision.mzML"

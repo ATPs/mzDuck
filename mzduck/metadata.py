@@ -15,6 +15,10 @@ from typing import Any
 
 SCAN_NUMBER_RE = re.compile(r"(?:^|\s)scan=(\d+)(?:\s|$)")
 SPECTRUM_LIST_RE = re.compile(br"<(?:[A-Za-z_][\w.\-]*:)?spectrumList\b")
+SPECTRUM_LIST_START_RE = re.compile(
+    rb"<(?:[A-Za-z_][\w.\-]*:)?spectrumList\b(?P<attrs>[^>]*)>",
+    re.DOTALL,
+)
 ATTR_RE = re.compile(br"([A-Za-z_][\w:.\-]*)\s*=\s*([\"'])(.*?)\2", re.DOTALL)
 
 
@@ -165,6 +169,30 @@ def read_mzml_header_prefix(
                 )
 
 
+def read_mzml_prefix_through_spectrum_list(
+    path: str | os.PathLike[str],
+    *,
+    chunk_size: int = 1024 * 1024,
+    max_header_bytes: int = 64 * 1024 * 1024,
+) -> bytes:
+    """Read bytes through the opening ``spectrumList`` tag."""
+    data = bytearray()
+    with Path(path).open("rb") as handle:
+        while True:
+            chunk = handle.read(chunk_size)
+            if not chunk:
+                return bytes(data)
+            data.extend(chunk)
+            match = SPECTRUM_LIST_START_RE.search(data)
+            if match is not None:
+                return bytes(data[: match.end()])
+            if len(data) > max_header_bytes:
+                raise ValueError(
+                    "mzML prefix exceeded "
+                    f"{max_header_bytes} bytes before spectrumList start tag"
+                )
+
+
 def extract_xml_fragment(header: bytes, tag: str) -> str | None:
     tag_bytes = tag.encode("ascii")
     pattern = re.compile(
@@ -198,11 +226,29 @@ def extract_run_attributes(header: bytes) -> dict[str, str]:
     }
 
 
+def extract_spectrum_list_attributes(prefix: bytes) -> dict[str, str]:
+    match = SPECTRUM_LIST_START_RE.search(prefix)
+    if match is None:
+        return {}
+    attrs = {}
+    for attr_match in ATTR_RE.finditer(match.group("attrs")):
+        key = attr_match.group(1).decode("utf-8", errors="replace")
+        value = attr_match.group(3).decode("utf-8", errors="replace")
+        attrs[key] = html.unescape(value)
+    return {
+        "spectrum_list_default_data_processing_ref": attrs.get(
+            "defaultDataProcessingRef", ""
+        ),
+    }
+
+
 def extract_header_metadata(path: str | os.PathLike[str]) -> dict[str, str]:
     """Extract mzML run attributes and selected header XML fragments."""
     metadata: dict[str, str] = {}
     header = read_mzml_header_prefix(path)
+    spectrum_prefix = read_mzml_prefix_through_spectrum_list(path)
     metadata.update(extract_run_attributes(header))
+    metadata.update(extract_spectrum_list_attributes(spectrum_prefix))
     for tag, key in HEADER_XML_KEYS.items():
         fragment = extract_xml_fragment(header, tag)
         if fragment is not None:

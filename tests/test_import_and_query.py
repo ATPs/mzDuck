@@ -10,7 +10,7 @@ from mzduck import MzDuckFile
 def test_import_creates_schema_and_metadata(tiny_mzduck):
     with MzDuckFile.open(tiny_mzduck, read_only=True) as db:
         metadata = db.metadata()
-        assert metadata["schema_version"] == "1"
+        assert metadata["schema_version"] == "2"
         assert metadata["format_name"] == "mzDuck"
         assert metadata["source_filename"] == "tiny.mzML"
         assert metadata["run_id"] == "tiny_run"
@@ -22,6 +22,10 @@ def test_import_creates_schema_and_metadata(tiny_mzduck):
         assert metadata["native_id_template"] == (
             "controllerType=0 controllerNumber=1 scan={scan_number}"
         )
+        assert metadata["spectrum_ref_template"] == (
+            "controllerType=0 controllerNumber=1 scan={precursor_scan_number}"
+        )
+        assert metadata["filter_string_encoding"] == "raw"
         assert metadata["index_scan_number"] == "false"
         assert metadata["mgf_title_template"] == (
             "{mgf_title_source}.{scan_number}.{scan_number}.{precursor_charge}"
@@ -37,12 +41,14 @@ def test_import_creates_schema_and_metadata(tiny_mzduck):
         assert db.query("SELECT COUNT(*) FROM mgf").fetchone()[0] == 2
         assert db.query("SELECT SUM(len(mz_array)) FROM mgf").fetchone()[0] == 5
         assert db.query("SELECT COUNT(*) FROM ms2_spectra").fetchone()[0] == 2
-        assert db.query("SELECT COUNT(*) FROM spectrum_summary").fetchone()[0] == 2
+        assert db.query("SELECT COUNT(*) FROM spectrum_text_overrides").fetchone()[0] == 0
+        assert db.query("SELECT COUNT(*) FROM spectrum_extra_params").fetchone()[0] == 0
         assert {row[0] for row in db.query("SHOW TABLES").fetchall()} == {
             "mgf",
             "ms2_spectra",
             "run_metadata",
-            "spectrum_summary",
+            "spectrum_text_overrides",
+            "spectrum_extra_params",
         }
         indexes = {
             row[0] for row in db.query("SELECT index_name FROM duckdb_indexes()").fetchall()
@@ -54,6 +60,7 @@ def test_get_spectrum_preserves_peak_order(tiny_mzduck):
     with MzDuckFile.open(tiny_mzduck, read_only=True) as db:
         spectrum = db.get_spectrum(2)
         assert spectrum["native_id"] == "controllerType=0 controllerNumber=1 scan=2"
+        assert spectrum["instrument_configuration_ref"] == "IC2"
         assert spectrum["scan_number"] == 2
         assert spectrum["rt"] == 2.0
         assert spectrum["rt_unit"] == "minute"
@@ -97,20 +104,22 @@ def test_sql_queries(tiny_mzduck):
 def test_inspect_summary(tiny_mzduck):
     with MzDuckFile.open(tiny_mzduck, read_only=True) as db:
         summary = db.inspect()
-    assert summary["schema_version"] == "1"
+    assert summary["schema_version"] == "2"
     assert summary["source_filename"] == "tiny.mzML"
     assert summary["spectrum_count"] == 2
     assert summary["peak_count"] == 5
     assert summary["ms1_spectrum_count"] == 0
     assert summary["ms2_spectrum_count"] == 2
     assert summary["mgf_spectrum_count"] == 2
+    assert summary["filter_string_encoding"] == "raw"
     assert summary["scan_number_range"] == [1, 2]
     assert summary["scan_numbers_contiguous"] is True
     assert summary["charge_distribution"] == {"2": 1, "3": 1}
     assert [item["table"] for item in summary["tables"]] == [
         "mgf",
         "ms2_spectra",
-        "spectrum_summary",
+        "spectrum_text_overrides",
+        "spectrum_extra_params",
     ]
 
 
@@ -150,11 +159,17 @@ def test_ms2_mgf_only_mode_has_only_mgf_contract(tiny_mzml, tmp_path):
 
     with MzDuckFile.open(path, read_only=True) as db:
         tables = {row[0] for row in db.query("SHOW TABLES").fetchall()}
-        assert tables == {"mgf", "run_metadata"}
+        assert tables == {
+            "mgf",
+            "ms2_spectra",
+            "run_metadata",
+            "spectrum_text_overrides",
+            "spectrum_extra_params",
+        }
         assert db.metadata()["import_mode"] == "ms2_mgf_only"
         spectrum = db.get_spectrum(1)
         assert spectrum["title"] == "mgf-only.1.1.2"
-        assert spectrum["activation_type"] is None
+        assert spectrum["activation_type"] == "HCD"
 
         mzml_path = tmp_path / "mgf-only-roundtrip.mzML"
         db.to_mzml(mzml_path)
@@ -177,7 +192,13 @@ def test_ms1_default_and_ms1_only_modes(tiny_with_ms1_mzml, tmp_path):
 
     with MzDuckFile.open(default_path, read_only=True) as db:
         tables = {row[0] for row in db.query("SHOW TABLES").fetchall()}
-        assert {"mgf", "ms1_spectra", "ms2_spectra", "spectrum_summary"} <= tables
+        assert {
+            "mgf",
+            "ms1_spectra",
+            "ms2_spectra",
+            "spectrum_text_overrides",
+            "spectrum_extra_params",
+        } <= tables
         assert db.inspect()["ms1_spectrum_count"] == 2
         assert db.inspect()["ms2_spectrum_count"] == 1
         ms1 = db.get_spectrum(1)
@@ -197,7 +218,7 @@ def test_ms1_default_and_ms1_only_modes(tiny_with_ms1_mzml, tmp_path):
 
     with MzDuckFile.open(ms1_only_path, read_only=True) as db:
         tables = {row[0] for row in db.query("SHOW TABLES").fetchall()}
-        assert tables == {"ms1_spectra", "run_metadata", "spectrum_summary"}
+        assert tables == {"ms1_spectra", "run_metadata"}
         assert db.inspect()["ms1_spectrum_count"] == 2
         assert db.inspect()["ms2_spectrum_count"] == 0
         with pytest.raises(ValueError, match="mgf table"):
@@ -221,3 +242,46 @@ def test_start_end_scan_subset(tiny_with_ms1_mzml, tmp_path):
         assert db.inspect()["total_spectrum_count"] == 1
         assert db.inspect()["ms2_spectrum_count"] == 1
         assert db.query("SELECT title FROM mgf").fetchone()[0] == "subset.2.2.2"
+
+
+def test_filter_string_encoder_uses_exact_thermo_rule(tiny_thermo_filter_mzml, tmp_path):
+    path = tmp_path / "thermo-filter.mzduck"
+    handle = MzDuckFile.from_mzml(
+        tiny_thermo_filter_mzml,
+        path,
+        overwrite=True,
+        batch_size=1,
+        compute_sha256=False,
+    )
+    handle.close()
+
+    with MzDuckFile.open(path, read_only=True) as db:
+        assert db.metadata()["filter_string_encoding"] == "thermo_ms2_v1"
+        assert db.query(
+            "SELECT COUNT(*) FROM spectrum_text_overrides WHERE field_name = 'filter_string'"
+        ).fetchone()[0] == 0
+        spectrum = db.get_spectrum(1)
+        assert (
+            spectrum["filter_string"]
+            == "FTMS + c NSI d Full ms2 445.3400@hcd27.50 [90.0000-1000.0000]"
+        )
+
+
+def test_filter_string_falls_back_to_raw_storage(tiny_raw_filter_mzml, tmp_path):
+    path = tmp_path / "raw-filter.mzduck"
+    handle = MzDuckFile.from_mzml(
+        tiny_raw_filter_mzml,
+        path,
+        overwrite=True,
+        batch_size=1,
+        compute_sha256=False,
+    )
+    handle.close()
+
+    with MzDuckFile.open(path, read_only=True) as db:
+        assert db.metadata()["filter_string_encoding"] == "raw"
+        assert db.query(
+            "SELECT COUNT(*) FROM spectrum_text_overrides WHERE field_name = 'filter_string'"
+        ).fetchone()[0] == 1
+        spectrum = db.get_spectrum(1)
+        assert spectrum["filter_string"] == "CUSTOM FILTER STRING"
