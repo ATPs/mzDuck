@@ -14,7 +14,7 @@ import duckdb
 import numpy as np
 import pandas as pd
 import pyarrow as pa
-from pyteomics import mzml, mzmlb
+from pyteomics import mzml
 
 from . import __version__
 from .metadata import (
@@ -59,11 +59,12 @@ def convert_mzml_to_mzduck(
     """Convert a centroid MS2 mzML file into a v1 mzDuck database."""
     source = Path(mzml_path)
     output = Path(output_path)
-    source_format = detect_source_format(source)
+    if source.suffix.lower() != ".mzml":
+        raise ValueError(f"Unsupported input format for mzDuck conversion: {source}")
     if not source.exists():
-        raise FileNotFoundError(f"Input mzML/mzMLb does not exist: {source}")
+        raise FileNotFoundError(f"Input mzML does not exist: {source}")
     if not source.is_file():
-        raise ValueError(f"Input mzML/mzMLb is not a file: {source}")
+        raise ValueError(f"Input mzML is not a file: {source}")
     if output.exists():
         if not overwrite:
             raise FileExistsError(f"Output already exists: {output}")
@@ -81,7 +82,6 @@ def convert_mzml_to_mzduck(
             creator="mzduck convert",
             mzduck_version=__version__,
             compute_sha256=compute_sha256,
-            source_format=source_format,
         )
         metadata.update(extract_header_metadata(source))
         upsert_metadata(conn, metadata)
@@ -98,7 +98,7 @@ def convert_mzml_to_mzduck(
         spectrum_count = 0
         peak_count = 0
 
-        with open_spectrum_reader(source) as reader:
+        with mzml.MzML(str(source)) as reader:
             for source_order, spectrum in enumerate(reader):
                 row, peaks, row_warnings = spectrum_to_row(
                     spectrum, scan_id=spectrum_count, source_order=source_order
@@ -165,22 +165,6 @@ def convert_mzml_to_mzduck(
         if conn is not None:
             conn.close()
     return output
-
-
-def detect_source_format(path: Path) -> str:
-    suffix = path.suffix.lower()
-    if suffix == ".mzml":
-        return "mzML"
-    if suffix == ".mzmlb":
-        return "mzMLb"
-    raise ValueError(f"Unsupported input format for mzDuck conversion: {path}")
-
-
-def open_spectrum_reader(path: Path):
-    source_format = detect_source_format(path)
-    if source_format == "mzMLb":
-        return mzmlb.MzMLb(str(path))
-    return mzml.MzML(str(path))
 
 
 def create_indexes_in_subprocess(output_path):

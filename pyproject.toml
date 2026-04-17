@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mzduck"
 version = "0.1.0"
-description = "DuckDB-backed storage for centroid MS2 mzML and mzMLb data"
+description = "DuckDB-backed storage for centroid MS2 mzML data"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {file = "LICENSE"}
@@ -14,7 +14,6 @@ authors = [
 ]
 dependencies = [
     "duckdb",
-    "h5py",
     "lxml",
     "numpy",
     "pandas",
@@ -36,6 +35,5 @@ mzduck = ["example_data/*"]
 testpaths = ["tests"]
 pythonpath = ["."]
 filterwarnings = [
-    "ignore:hdf5plugin is missing.*:UserWarning",
     "ignore:No reference was found.*:psims.document.ReferentialIntegrityWarning",
 ]

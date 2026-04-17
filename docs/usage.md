@@ -4,14 +4,12 @@ This guide uses the bundled tiny example data:
 
 ```text
 mzduck/example_data/tiny.mzML
-mzduck/example_data/tiny.mzMLb
 mzduck/example_data/tiny.mzduck
 mzduck/example_data/tiny.mgf
 ```
 
-The tiny mzML and mzMLb files contain two centroid MS2 spectra. They are
-intentionally small so examples run quickly and so users can inspect the text
-output by eye.
+The tiny mzML file contains two centroid MS2 spectra. It is intentionally small
+so examples run quickly and so users can inspect the text output by eye.
 
 ## Install
 
@@ -32,15 +30,16 @@ mzduck --help
 ```bash
 mzduck convert \
   mzduck/example_data/tiny.mzML \
-  /tmp/tiny.mzduck \
+  -o /tmp/tiny.mzduck \
   --overwrite \
   --no-sha256
 ```
 
-The same command accepts mzMLb input:
+Commands that write files accept either a positional output path or `-o/--out`:
 
 ```bash
-mzduck convert input.mzMLb /tmp/from_mzmlb.mzduck --overwrite --no-sha256
+mzduck convert mzduck/example_data/tiny.mzML /tmp/tiny.mzduck --overwrite
+mzduck convert mzduck/example_data/tiny.mzML --out /tmp/tiny.mzduck --overwrite
 ```
 
 Inspect the result:
@@ -62,7 +61,7 @@ Expected key values:
 ## Export mzDuck to MGF
 
 ```bash
-mzduck export-mgf /tmp/tiny.mzduck /tmp/tiny.mgf --overwrite
+mzduck export-mgf /tmp/tiny.mzduck -o /tmp/tiny.mgf --overwrite
 ```
 
 The MGF output contains one `BEGIN IONS` block per MS2 spectrum.
@@ -70,20 +69,27 @@ The MGF output contains one `BEGIN IONS` block per MS2 spectrum.
 ## Export mzDuck to mzML
 
 ```bash
-mzduck export-mzml /tmp/tiny.mzduck /tmp/tiny.roundtrip.mzML --overwrite
+mzduck export-mzml /tmp/tiny.mzduck -o /tmp/tiny.roundtrip.mzML --overwrite
 ```
 
 The mzML output is semantic round-trip output written through `psims`. It is not
 expected to be byte-identical to the original mzML.
 
-## Export mzDuck to mzMLb
+Precision flags control the mzML binary array value types:
 
 ```bash
-mzduck export-mzmlb /tmp/tiny.mzduck /tmp/tiny.roundtrip.mzMLb --overwrite
-```
+# Both m/z and intensity arrays as 32-bit floats.
+mzduck export-mzml /tmp/tiny.mzduck -o /tmp/tiny.32.mzML --32 --overwrite
 
-The mzMLb output uses `psims.mzmlb.MzMLbWriter`. If `hdf5plugin` is unavailable,
-psims falls back to gzip compression.
+# Both arrays as 64-bit floats.
+mzduck export-mzml /tmp/tiny.mzduck -o /tmp/tiny.64.mzML --64 --overwrite
+
+# Per-array control. This is also the default.
+mzduck export-mzml /tmp/tiny.mzduck -o /tmp/tiny.mz64-int32.mzML --mz64 --inten32 --overwrite
+
+# Mixed precision in the other direction.
+mzduck export-mzml /tmp/tiny.mzduck -o /tmp/tiny.mz32-int64.mzML --mz32 --inten64 --overwrite
+```
 
 ## Query With Python
 

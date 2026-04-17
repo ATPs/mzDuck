@@ -1,21 +1,21 @@
 # mzDuck
 
-mzDuck is a Python package for storing centroid MS2 mzML or mzMLb data in a single
+mzDuck is a Python package for storing centroid MS2 mzML data in a single
 DuckDB database file. It keeps spectra and peaks queryable with ordinary SQL
-while preserving enough metadata for MGF export and semantic mzML/mzMLb export.
+while preserving enough metadata for MGF export and semantic mzML export.
 
 The current v1 scope is intentionally focused:
 
-- input: centroid MS2 mzML or mzMLb;
+- input: centroid MS2 mzML;
 - storage: one `.mzduck` DuckDB database per source run;
-- output: `.mgf`, `.mzML`, and `.mzMLb`;
+- output: `.mgf` and `.mzML`;
 - API: Python class plus `mzduck` command-line tool.
 
 ## Repository Contents
 
 ```text
 mzduck/                     Python package
-mzduck/example_data/         tiny bundled mzML, mzMLb, mzDuck, and MGF examples
+mzduck/example_data/         tiny bundled mzML, mzDuck, and MGF examples
 examples/                    runnable example scripts
 docs/usage.md                detailed usage guide
 tests/                       pytest suite
@@ -43,13 +43,12 @@ The package includes a tiny two-spectrum example set:
 
 ```text
 mzduck/example_data/tiny.mzML
-mzduck/example_data/tiny.mzMLb
 mzduck/example_data/tiny.mzduck
 mzduck/example_data/tiny.mgf
 ```
 
-The tiny mzML and mzMLb files have two centroid MS2 spectra and five total
-peaks. They are useful for smoke tests, docs, and quick manual inspection.
+The tiny mzML file has two centroid MS2 spectra and five total peaks. It is
+useful for smoke tests, docs, and quick manual inspection.
 
 Regenerate the example data with:
 
@@ -64,15 +63,9 @@ Convert mzML to mzDuck:
 ```bash
 mzduck convert \
   mzduck/example_data/tiny.mzML \
-  /tmp/tiny.mzduck \
+  -o /tmp/tiny.mzduck \
   --overwrite \
   --no-sha256
-```
-
-Convert mzMLb to mzDuck in the same way:
-
-```bash
-mzduck convert input.mzMLb output.mzduck --overwrite --no-sha256
 ```
 
 Inspect the mzDuck file:
@@ -84,20 +77,31 @@ mzduck inspect /tmp/tiny.mzduck --json
 Export MGF:
 
 ```bash
-mzduck export-mgf /tmp/tiny.mzduck /tmp/tiny.mgf --overwrite
+mzduck export-mgf /tmp/tiny.mzduck -o /tmp/tiny.mgf --overwrite
 ```
 
 Export mzML:
 
 ```bash
-mzduck export-mzml /tmp/tiny.mzduck /tmp/tiny.roundtrip.mzML --overwrite
+mzduck export-mzml /tmp/tiny.mzduck -o /tmp/tiny.roundtrip.mzML --overwrite
 ```
 
-Export mzMLb:
+Control mzML binary array precision:
 
 ```bash
-mzduck export-mzmlb /tmp/tiny.mzduck /tmp/tiny.roundtrip.mzMLb --overwrite
+# Both arrays as 32-bit floats.
+mzduck export-mzml /tmp/tiny.mzduck -o /tmp/tiny.32.mzML --32 --overwrite
+
+# Keep the default: m/z 64-bit, intensity 32-bit.
+mzduck export-mzml /tmp/tiny.mzduck -o /tmp/tiny.mz64-int32.mzML --mz64 --inten32 --overwrite
+
+# Mixed precision is allowed.
+mzduck export-mzml /tmp/tiny.mzduck -o /tmp/tiny.mz32-int64.mzML --mz32 --inten64 --overwrite
 ```
+
+Commands that write files accept either a positional output path or `-o/--out`.
+For example, `mzduck convert input.mzML output.mzduck` and
+`mzduck convert input.mzML -o output.mzduck` are equivalent.
 
 ## Python Quick Start
 
@@ -133,7 +137,6 @@ try:
 
     db.to_mgf("/tmp/tiny.mgf", overwrite=True)
     db.to_mzml("/tmp/tiny.roundtrip.mzML", overwrite=True)
-    db.to_mzmlb("/tmp/tiny.roundtrip.mzMLb", overwrite=True)
 finally:
     db.close()
 ```
@@ -217,13 +220,12 @@ Run the test suite:
 /data/p/anaconda3/bin/python -m pytest -q
 ```
 
-The tests generate a tiny mzML fixture, convert it to mzDuck, export
-MGF/mzML/mzMLb, and validate round-trip parsing.
+The tests generate a tiny mzML fixture, convert it to mzDuck, export MGF/mzML,
+and validate round-trip parsing.
 
 ## Notes
 
-- mzML and mzMLb export use `psims`. If `hdf5plugin` is not installed, psims
-  writes mzMLb with gzip compression instead of Blosc.
+- mzML export uses `psims`.
 - v1 mzML round-trip means semantic equivalence for supported MS2 fields, not
   byte-identical XML.
 - The full-size validation fixture from the design is much larger and is not

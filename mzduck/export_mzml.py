@@ -30,7 +30,14 @@ def rt_to_minutes(value, unit):
     raise ValueError(f"Cannot convert retention time unit to minutes: {unit!r}")
 
 
-def export_mzml(conn, output_path, *, overwrite=False):
+def export_mzml(
+    conn,
+    output_path,
+    *,
+    overwrite=False,
+    mz_precision=64,
+    intensity_precision=32,
+):
     try:
         from psims.mzml import MzMLWriter
         from psims.document import ReferentialIntegrityWarning
@@ -38,65 +45,18 @@ def export_mzml(conn, output_path, *, overwrite=False):
         raise RuntimeError("psims is required for mzML export") from exc
 
     path = ensure_output_path(output_path, overwrite=overwrite)
-    return export_with_writer(
-        conn,
-        path,
-        writer_factory=lambda p: p.open("wb"),
-        writer_class=MzMLWriter,
-        close=False,
-        referential_warning_class=ReferentialIntegrityWarning,
-    )
-
-
-def export_mzmlb(conn, output_path, *, overwrite=False):
-    try:
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                message="hdf5plugin is missing.*",
-                category=UserWarning,
-            )
-            from psims.document import ReferentialIntegrityWarning
-            from psims.mzmlb import MzMLbWriter
-    except ImportError as exc:
-        raise RuntimeError("psims with mzMLb support is required for mzMLb export") from exc
-
-    path = ensure_output_path(output_path, overwrite=overwrite)
-    return export_with_writer(
-        conn,
-        path,
-        writer_factory=lambda p: str(p),
-        writer_class=MzMLbWriter,
-        close=True,
-        referential_warning_class=ReferentialIntegrityWarning,
-    )
-
-
-def export_with_writer(
-    conn,
-    path,
-    *,
-    writer_factory,
-    writer_class,
-    close,
-    referential_warning_class,
-):
+    mz_dtype = dtype_for_precision(mz_precision, "m/z")
+    intensity_dtype = dtype_for_precision(intensity_precision, "intensity")
     metadata = dict(conn.execute("SELECT key, value FROM run_metadata").fetchall())
     run_id = metadata.get("run_id") or "mzduck_run"
     count = conn.execute("SELECT COUNT(*) FROM spectra").fetchone()[0]
 
     with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", category=referential_warning_class)
-        warnings.filterwarnings(
-            "ignore",
-            message="hdf5plugin is missing.*",
-            category=UserWarning,
-        )
-        stream_or_path = writer_factory(path)
-        try:
-            with writer_class(
-                stream_or_path,
-                close=close,
+        warnings.filterwarnings("ignore", category=ReferentialIntegrityWarning)
+        with path.open("wb") as stream:
+            with MzMLWriter(
+                stream,
+                close=False,
                 missing_reference_is_error=False,
             ) as writer:
                 writer.register("Software", "mzduck")
@@ -157,14 +117,18 @@ def export_with_writer(
                                 [spectrum["scan_id"]],
                             ).fetchall()
                             mz_array = np.asarray(
-                                [peak[0] for peak in peaks], dtype=np.float64
+                                [peak[0] for peak in peaks], dtype=mz_dtype
                             )
                             intensity_array = np.asarray(
-                                [peak[1] for peak in peaks], dtype=np.float32
+                                [peak[1] for peak in peaks], dtype=intensity_dtype
                             )
                             writer.write_spectrum(
                                 mz_array=mz_array,
                                 intensity_array=intensity_array,
+                                encoding={
+                                    "m/z array": mz_dtype,
+                                    "intensity array": intensity_dtype,
+                                },
                                 id=spectrum["native_id"],
                                 polarity=polarity_param(spectrum.get("polarity")),
                                 centroided=bool_or_default(
@@ -178,11 +142,16 @@ def export_with_writer(
                                 scan_params=scan_params(spectrum),
                                 scan_window_list=scan_window_list(spectrum),
                             )
-        finally:
-            close_stream = getattr(stream_or_path, "close", None)
-            if callable(close_stream) and not close:
-                close_stream()
     return path
+
+
+def dtype_for_precision(precision, label):
+    value = int(precision)
+    if value == 32:
+        return np.float32
+    if value == 64:
+        return np.float64
+    raise ValueError(f"{label} precision must be 32 or 64, got {precision!r}")
 
 
 def bool_or_default(value, default):

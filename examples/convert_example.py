@@ -29,7 +29,6 @@ def main() -> None:
     mzduck_path = outdir / "tiny.mzduck"
     mgf_path = outdir / "tiny.mgf"
     mzml_path = outdir / "tiny.roundtrip.mzML"
-    mzmlb_path = outdir / "tiny.roundtrip.mzMLb"
 
     db = MzDuckFile.from_mzml(
         INPUT_MZML,
@@ -42,14 +41,12 @@ def main() -> None:
         print(db.inspect())
         db.to_mgf(mgf_path, overwrite=True)
         db.to_mzml(mzml_path, overwrite=True)
-        db.to_mzmlb(mzmlb_path, overwrite=True)
     finally:
         db.close()
 
     print(f"mzDuck: {mzduck_path}")
     print(f"MGF: {mgf_path}")
     print(f"mzML: {mzml_path}")
-    print(f"mzMLb: {mzmlb_path}")
 
 
 if __name__ == "__main__":

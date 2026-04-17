@@ -165,37 +165,6 @@ def read_mzml_header_prefix(
                 )
 
 
-def read_mzmlb_header_prefix(
-    path: str | os.PathLike[str],
-    *,
-    chunk_size: int = 1024 * 1024,
-    max_header_bytes: int = 64 * 1024 * 1024,
-) -> bytes:
-    """Read mzML XML header bytes from an mzMLb HDF5 container."""
-    import h5py
-
-    data = bytearray()
-    with h5py.File(path, "r") as handle:
-        if "mzML" not in handle:
-            raise ValueError("mzMLb file is missing required 'mzML' dataset")
-        dataset = handle["mzML"]
-        total = len(dataset)
-        offset = 0
-        while offset < total:
-            end = min(offset + chunk_size, total)
-            chunk = bytes(dataset[offset:end])
-            data.extend(chunk)
-            match = SPECTRUM_LIST_RE.search(data)
-            if match is not None:
-                return bytes(data[: match.start()])
-            if len(data) > max_header_bytes:
-                raise ValueError(
-                    f"mzMLb XML header exceeded {max_header_bytes} bytes before spectrumList"
-                )
-            offset = end
-    return bytes(data)
-
-
 def extract_xml_fragment(header: bytes, tag: str) -> str | None:
     tag_bytes = tag.encode("ascii")
     pattern = re.compile(
@@ -232,11 +201,7 @@ def extract_run_attributes(header: bytes) -> dict[str, str]:
 def extract_header_metadata(path: str | os.PathLike[str]) -> dict[str, str]:
     """Extract mzML run attributes and selected header XML fragments."""
     metadata: dict[str, str] = {}
-    suffix = Path(path).suffix.lower()
-    if suffix == ".mzmlb":
-        header = read_mzmlb_header_prefix(path)
-    else:
-        header = read_mzml_header_prefix(path)
+    header = read_mzml_header_prefix(path)
     metadata.update(extract_run_attributes(header))
     for tag, key in HEADER_XML_KEYS.items():
         fragment = extract_xml_fragment(header, tag)
@@ -251,7 +216,6 @@ def provenance_metadata(
     creator: str,
     mzduck_version: str,
     compute_sha256: bool,
-    source_format: str = "mzML",
 ) -> dict[str, str]:
     path = Path(source_path)
     stat = path.stat()
@@ -273,6 +237,6 @@ def provenance_metadata(
         "source_filename": path.name,
         "source_size_bytes": str(stat.st_size),
         "source_sha256": source_sha256(path) if compute_sha256 else "",
-        "source_format": source_format,
+        "source_format": "mzML",
     }
     return metadata

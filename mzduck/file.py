@@ -8,7 +8,7 @@ import duckdb
 import numpy as np
 
 from .export_mgf import export_mgf
-from .export_mzml import export_mzml, export_mzmlb
+from .export_mzml import export_mzml
 from .import_mzml import convert_mzml_to_mzduck
 from .schema import validate_required_schema
 
@@ -57,13 +57,22 @@ class MzDuckFile:
         """Export to MGF format."""
         return export_mgf(self.conn, output_path, overwrite=overwrite)
 
-    def to_mzml(self, output_path, *, overwrite=False):
+    def to_mzml(
+        self,
+        output_path,
+        *,
+        overwrite=False,
+        mz_precision=64,
+        intensity_precision=32,
+    ):
         """Export to mzML format using psims."""
-        return export_mzml(self.conn, output_path, overwrite=overwrite)
-
-    def to_mzmlb(self, output_path, *, overwrite=False):
-        """Export to mzMLb format using psims."""
-        return export_mzmlb(self.conn, output_path, overwrite=overwrite)
+        return export_mzml(
+            self.conn,
+            output_path,
+            overwrite=overwrite,
+            mz_precision=mz_precision,
+            intensity_precision=intensity_precision,
+        )
 
     def get_spectrum(self, scan_id) -> dict:
         """Get a single spectrum by scan ID."""

@@ -12,7 +12,6 @@ import sys
 
 import numpy as np
 from psims.mzml import MzMLWriter
-from psims.transform.mzml import MzMLToMzMLb
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -140,12 +139,10 @@ def write_tiny_mzml(path: Path) -> None:
 def main() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     mzml_path = DATA_DIR / "tiny.mzML"
-    mzmlb_path = DATA_DIR / "tiny.mzMLb"
     mzduck_path = DATA_DIR / "tiny.mzduck"
     mgf_path = DATA_DIR / "tiny.mgf"
 
     write_tiny_mzml(mzml_path)
-    MzMLToMzMLb(str(mzml_path), str(mzmlb_path)).write()
     db = MzDuckFile.from_mzml(
         mzml_path,
         mzduck_path,
@@ -159,7 +156,6 @@ def main() -> None:
         db.close()
 
     print(f"Wrote {mzml_path}")
-    print(f"Wrote {mzmlb_path}")
     print(f"Wrote {mzduck_path}")
     print(f"Wrote {mgf_path}")
 

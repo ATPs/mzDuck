@@ -3,7 +3,6 @@
 This directory contains a tiny centroid-MS2 example set:
 
 - `tiny.mzML`: source mzML with two MS2 spectra and five total peaks.
-- `tiny.mzMLb`: mzMLb conversion of `tiny.mzML`.
 - `tiny.mzduck`: mzDuck conversion of `tiny.mzML`.
 - `tiny.mgf`: MGF export from `tiny.mzduck`.
 

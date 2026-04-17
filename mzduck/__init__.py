@@ -1,4 +1,4 @@
-"""mzDuck: DuckDB-backed storage for centroid MS2 mzML and mzMLb data."""
+"""mzDuck: DuckDB-backed storage for centroid MS2 mzML data."""
 
 __version__ = "0.1.0"
 
@@ -7,7 +7,7 @@ from .examples import example_data_path
 
 
 def from_mzml(mzml_path, output_path, *, overwrite=False, batch_size=5000):
-    """Convert one mzML or mzMLb file into one mzDuck file."""
+    """Convert one mzML file into one mzDuck file."""
     return MzDuckFile.from_mzml(
         mzml_path,
         output_path,
@@ -30,20 +30,15 @@ def to_mgf(mzduck_path, output_path):
         handle.close()
 
 
-def to_mzml(mzduck_path, output_path):
+def to_mzml(mzduck_path, output_path, *, mz_precision=64, intensity_precision=32):
     """Export an mzDuck file to mzML."""
     handle = MzDuckFile.open(mzduck_path, read_only=True)
     try:
-        return handle.to_mzml(output_path)
-    finally:
-        handle.close()
-
-
-def to_mzmlb(mzduck_path, output_path):
-    """Export an mzDuck file to mzMLb."""
-    handle = MzDuckFile.open(mzduck_path, read_only=True)
-    try:
-        return handle.to_mzmlb(output_path)
+        return handle.to_mzml(
+            output_path,
+            mz_precision=mz_precision,
+            intensity_precision=intensity_precision,
+        )
     finally:
         handle.close()
 
@@ -56,5 +51,4 @@ __all__ = [
     "open",
     "to_mgf",
     "to_mzml",
-    "to_mzmlb",
 ]

@@ -1,27 +1,20 @@
 from __future__ import annotations
 
-from pyteomics import mgf, mzml, mzmlb
+from pyteomics import mgf, mzml
 
 from mzduck import MzDuckFile, example_data_path
 
 
 def test_bundled_example_data_files_are_readable():
     mzml_path = example_data_path("tiny.mzML")
-    mzmlb_path = example_data_path("tiny.mzMLb")
     mzduck_path = example_data_path("tiny.mzduck")
     mgf_path = example_data_path("tiny.mgf")
 
     assert mzml_path.is_file()
-    assert mzmlb_path.is_file()
     assert mzduck_path.is_file()
     assert mgf_path.is_file()
 
     with mzml.MzML(str(mzml_path)) as reader:
-        spectra = list(reader)
-    assert len(spectra) == 2
-    assert sum(len(spectrum["m/z array"]) for spectrum in spectra) == 5
-
-    with mzmlb.MzMLb(str(mzmlb_path)) as reader:
         spectra = list(reader)
     assert len(spectra) == 2
     assert sum(len(spectrum["m/z array"]) for spectrum in spectra) == 5
