@@ -2,7 +2,7 @@
 
 Run from the repository root:
 
-    /data/p/anaconda3/bin/python examples/make_example_data.py
+    python examples/make_example_data.py
 """
 
 from __future__ import annotations

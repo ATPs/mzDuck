@@ -86,4 +86,7 @@ Date: 2026-04-17 19:15 Asia/Shanghai
 
 ## Pending validation
 
-- broader benchmarking and size analysis across more PRIDE projects if needed
+- follow-up size analysis and docs sync were completed on 2026-04-20 in
+  `design/develop-notes/20260420-1456-usage-benchmark-sync.md`
+- broader cross-project benchmarking remains optional future work, not a
+  blocker for the April 17 v2 rollout

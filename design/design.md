@@ -234,6 +234,19 @@ Default output is one `.mzduck` file.
 - top-level Python API remains importable:
   `MzDuckFile`, `from_mzml`, `open`, `to_mgf`, `to_mzml`
 
+## Validation snapshot
+
+Observed size results from the April 17 validation run:
+
+- `1556259.v2.mzduck` is 90.26 MiB, down from the previous 120.01 MiB default file
+- `1556259.v2.ms2-mgf-only.mzduck` is 90.26 MiB, down from the previous 135.01 MiB `--ms2-mgf-only` file
+- the matching `1556259.mzMLb` benchmark is 83.26 MiB, so the current v2 default output is within about 7 MiB
+- across the fixed 10-file `.mzML.gz` PRIDE validation set, default DuckDB output averaged 97.2% of source gzip size, with a range of 89.9% to 102.3%
+- on the three-file compact-mode sample set, `--ms2-mgf-only` measured 144.26 MiB for `708040`, 8.26 MiB for `1802513`, and 68.76 MiB for `1861786`
+- on the same sample set, `--parquet-zip` tracked default physical-table size closely at 281.47 MiB, 80.39 MiB, and 161.99 MiB
+
+This closes the original open-ended size-analysis note for the April 17 redesign work. Broader cross-project benchmarking can still be done later, but it is no longer a missing deliverable for the v2 rollout.
+
 ## Validation priorities
 
 The current acceptance focus is:

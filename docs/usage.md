@@ -8,24 +8,28 @@ mzduck/example_data/tiny.mzduck
 mzduck/example_data/tiny.mgf
 ```
 
-The tiny mzML file contains two centroid MS2 spectra. It is intentionally small
-so examples run quickly and so users can inspect the text output by eye.
+The tiny example is a v2 DuckDB-backed `.mzduck` file with two centroid MS2
+spectra and five total peaks. It is intentionally small so examples run
+quickly and the stored arrays can be inspected by eye.
 
 ## Install
 
 From the repository root:
 
 ```bash
-/data/p/anaconda3/bin/python -m pip install -e .
+python -m pip install -e .
 ```
 
-After installation, the `mzduck` command should be available:
+After installation, either of these should work:
 
 ```bash
 mzduck --help
+python -m mzduck --help
 ```
 
 ## Convert mzML to mzDuck
+
+Default DuckDB output:
 
 ```bash
 mzduck convert \
@@ -34,6 +38,15 @@ mzduck convert \
   --overwrite \
   --no-sha256 \
   --compression zstd
+```
+
+Gzipped mzML input is supported too:
+
+```bash
+mzduck convert \
+  input.mzML.gz \
+  -o /tmp/tiny-from-gzip.mzduck \
+  --overwrite
 ```
 
 Commands that write files accept either a positional output path or `-o/--out`:
@@ -49,34 +62,45 @@ Inspect the result:
 mzduck inspect /tmp/tiny.mzduck --json
 ```
 
-Expected key values:
+Expected key values for the bundled tiny example:
 
 ```json
 {
+  "schema_version": "2",
+  "container_format": "duckdb",
   "spectrum_count": 2,
-  "peak_count": 5,
-  "schema_version": "1"
+  "peak_count": 5
 }
 ```
 
-## Table Modes
+## Storage Model
 
-Default conversion stores:
+Default v2 conversion stores:
 
 - `run_metadata`
 - `mgf`
 - `ms2_spectra`
-- `ms1_spectra` when the input has MS1 and MS1 is not disabled
-- higher MSn tables such as `ms3_spectra` when present
-- `spectrum_summary`
+- `ms1_spectra` when the input includes MS1 and MS1 is not disabled
+- higher `msN_spectra` tables when present
+- non-empty `spectrum_text_overrides`
+- non-empty `spectrum_extra_params`
+
+Important v2 behavior:
+
+- `mgf` is a physical MS2 payload table, not a derived view
+- `ms2_spectra` is detail-only and keyed by `scan_number`
+- `TITLE` is derived and is not stored as `mgf.title`
+- empty optional tables are omitted from the final `.mzduck` file
+
+## Table Modes
 
 Mode examples:
 
 ```bash
-# Only run_metadata and the MS2 MGF contract table.
+# Only run_metadata plus the MGF-native MS2 payload.
 mzduck convert input.mzML -o /tmp/ms2-mgf-only.mzduck --ms2-mgf-only --overwrite
 
-# Keep MS2 MGF rows and MS2 metadata, skip all other MS levels.
+# Keep MS2 payload and the richer MS2 detail table, skip other MS levels.
 mzduck convert input.withMS1.mzML -o /tmp/ms2-only.mzduck --ms2-only --overwrite
 
 # Keep only MS1 spectra and MS1 peak arrays.
@@ -88,9 +112,42 @@ mzduck convert input.withMS1.mzML -o /tmp/no-ms1.mzduck --no-ms1 --overwrite
 # Inclusive scan-number subset.
 mzduck convert input.mzML -o /tmp/window.mzduck --start-scan 1000 --end-scan 2000 --overwrite
 
-# Index exact scan-number lookups on the MGF table only.
+# Index exact scan-number lookups on the physical mgf table.
 mzduck convert input.mzML -o /tmp/indexed.mzduck --index-scan --overwrite
 ```
+
+## Alternate Containers
+
+Parquet folder:
+
+```bash
+mzduck convert input.mzML.gz -o /tmp/out-parquet --parquet --overwrite
+```
+
+Parquet zip:
+
+```bash
+mzduck convert input.mzML.gz -o /tmp/out.parquet.zip --parquet-zip --overwrite
+```
+
+These modes write the same physical relations as the DuckDB output for the
+selected mode, omit empty optional tables, and leave `MzDuckFile.open()`
+reserved for DuckDB `.mzduck` files.
+
+## Reconstructed Fields
+
+`MzDuckFile.get_spectrum()`, `export-mgf`, and `export-mzml` reconstruct some
+text fields instead of storing them row-by-row when an exact run-level rule is
+available:
+
+- `TITLE` is derived from the run metadata template plus scan number and charge
+- `native_id` can use `native_id_template`
+- `spectrum_ref` can use `spectrum_ref_template`
+- `filter_string` uses exact per-run encoder detection and falls back to raw
+  stored strings when no exact rule exists
+
+If any row does not fit the run-level rule exactly, mzDuck stores only the
+exception rows in `spectrum_text_overrides`.
 
 ## Export mzDuck to MGF
 
@@ -98,7 +155,8 @@ mzduck convert input.mzML -o /tmp/indexed.mzduck --index-scan --overwrite
 mzduck export-mgf /tmp/tiny.mzduck -o /tmp/tiny.mgf --overwrite
 ```
 
-The MGF output contains one `BEGIN IONS` block per MS2 spectrum.
+The MGF output contains one `BEGIN IONS` block per MS2 spectrum. `TITLE` is
+always derived during export.
 
 ## Export mzDuck to mzML
 
@@ -106,8 +164,8 @@ The MGF output contains one `BEGIN IONS` block per MS2 spectrum.
 mzduck export-mzml /tmp/tiny.mzduck -o /tmp/tiny.roundtrip.mzML --overwrite
 ```
 
-The mzML output is semantic round-trip output written through `psims`. It is not
-expected to be byte-identical to the original mzML.
+The mzML output is a semantic round-trip written through `psims`. It is not
+expected to be byte-identical to the original mzML XML.
 
 Precision flags control the mzML binary array value types:
 
@@ -134,6 +192,7 @@ with MzDuckFile.open(example_data_path("tiny.mzduck")) as db:
     print(db.inspect())
 
     spectrum = db.get_spectrum(1)
+    print(spectrum["title"])
     print(spectrum["native_id"])
     print(spectrum["mz"])
     print(spectrum["intensity"])
@@ -172,6 +231,21 @@ WHERE scan_number = 1
 ORDER BY peak_index;
 ```
 
+Join MS2 payload with optional detail:
+
+```sql
+SELECT
+  m.scan_number,
+  m.rt,
+  m.precursor_mz,
+  d.precursor_scan_number,
+  d.collision_energy,
+  d.activation_type
+FROM mgf AS m
+LEFT JOIN ms2_spectra AS d USING (scan_number)
+ORDER BY m.source_index;
+```
+
 Extract a product-ion chromatogram:
 
 ```sql
@@ -188,19 +262,26 @@ GROUP BY rt
 ORDER BY rt;
 ```
 
+Inspect exact text fallbacks:
+
+```sql
+SELECT scan_number, field_name, value
+FROM spectrum_text_overrides
+ORDER BY scan_number, field_name;
+```
+
 ## Metadata
 
-`run_metadata` stores provenance, mzML header XML fragments, counts by MS level,
-array dtype choices, compression settings, and a JSON `table_registry`. The
-registry is useful for deciding whether a file can export to MGF, whether MS1
-peaks are present, and which table has a scan-number index.
+`run_metadata` stores provenance, mzML header XML fragments, counts by MS
+level, array dtype choices, compaction settings, templates, filter-string
+policy, `source_compression`, `container_format`, and a JSON table registry.
 
 ## Regenerate Example Data
 
-The example files are generated from `examples/make_example_data.py`:
+The bundled example files are generated from `examples/make_example_data.py`:
 
 ```bash
-/data/p/anaconda3/bin/python examples/make_example_data.py
+python examples/make_example_data.py
 ```
 
 This rewrites the files under `mzduck/example_data/`.

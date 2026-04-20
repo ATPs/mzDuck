@@ -173,6 +173,36 @@ The current v2 split is designed so that:
 - the full/default run can preserve the mzML detail layer
 - `--ms2-mgf-only` can stay smaller by keeping only the MGF-native payload
 
+### Observed validation snapshot
+
+The fixed `1556259` benchmark now lands at:
+
+| Artifact | Size |
+| --- | ---: |
+| `1556259.mzML` | 408.44 MiB |
+| `1556259.mzMLb` | 83.26 MiB |
+| previous `1556259.mzduck` | 120.01 MiB |
+| previous `1556259.ms2-mgf-only.mzduck` | 135.01 MiB |
+| `1556259.v2.mzduck` | 90.26 MiB |
+| `1556259.v2.ms2-mgf-only.mzduck` | 90.26 MiB |
+
+That means the current v2 default output is about 29.75 MiB smaller than the
+previous default file, the current v2 `--ms2-mgf-only` output is about 44.75
+MiB smaller than the previous `--ms2-mgf-only` file, and the v2 default output
+is within about 7 MiB of the matching mzMLb benchmark.
+
+Across the fixed 10-file `.mzML.gz` PRIDE validation set used during the April
+17 validation pass, default DuckDB output averaged 97.2% of the source gzip
+size, with an observed range of 89.9% to 102.3%.
+
+Sample compact-mode sizes from the same validation run:
+
+| Stem | Default | `--ms2-mgf-only` | `--parquet-zip` |
+| --- | ---: | ---: | ---: |
+| `708040` | 279.01 MiB | 144.26 MiB | 281.47 MiB |
+| `1802513` | 84.51 MiB | 8.26 MiB | 80.39 MiB |
+| `1861786` | 159.76 MiB | 68.76 MiB | 161.99 MiB |
+
 ## Installation
 
 From this repository:

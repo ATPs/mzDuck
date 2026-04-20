@@ -21,8 +21,10 @@ def test_bundled_example_data_files_are_readable():
 
     with MzDuckFile.open(mzduck_path) as db:
         summary = db.inspect()
+        assert summary["schema_version"] == "2"
         assert summary["spectrum_count"] == 2
         assert summary["peak_count"] == 5
+        assert [item["table"] for item in summary["tables"]] == ["mgf", "ms2_spectra"]
         assert db.get_spectrum(1)["native_id"].endswith("scan=1")
 
     with mgf.read(str(mgf_path)) as reader:
