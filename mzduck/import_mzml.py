@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
+import sys
+import textwrap
 import uuid
+import zipfile
 from collections import Counter
 from pathlib import Path
 
@@ -21,8 +26,10 @@ from .metadata import (
     first_nested,
     normalize_unit,
     numeric_with_unit,
+    open_mzml_binary,
     parse_scan_number,
     provenance_metadata,
+    source_compression_for_path,
     unit_of,
 )
 from .reconstruction import (
@@ -33,18 +40,22 @@ from .reconstruction import (
 )
 from .schema import (
     EXTRA_PARAM_COLUMNS,
+    MGF_COLUMNS,
     MS1_COLUMNS,
     MS2_COLUMNS,
     MSN_COLUMNS,
     TEXT_OVERRIDE_COLUMNS,
     create_scan_index,
     create_schema,
+    data_table_names,
     default_metadata_values,
     metadata_json,
     msn_table_name,
+    relation_type,
     table_count,
     table_peak_count,
     table_registry,
+    table_exists,
     upsert_metadata,
     validate_required_schema,
 )
@@ -102,6 +113,8 @@ SCALAR_ARROW_TYPES = {
     "unit_name": pa.string(),
     "cv_ref": pa.string(),
 }
+
+MAX_ARRAY_VALUES_PER_BATCH = 250_000
 
 TOP_LEVEL_PARAM_SKIP = {
     "index",
@@ -195,7 +208,8 @@ def convert_mzml_to_mzduck(
     warnings = list(pre_scan["warnings"])
 
     include_ms1 = pre_scan["included_counts"].get(1, 0) > 0 and options["include_ms1"]
-    include_ms2 = pre_scan["included_counts"].get(2, 0) > 0 and not options["ms1_only"]
+    include_mgf = pre_scan["included_counts"].get(2, 0) > 0 and not options["ms1_only"]
+    include_ms2_detail = include_mgf and not options["ms2_mgf_only"]
     msn_levels = [
         level
         for level, count in pre_scan["included_counts"].items()
@@ -210,7 +224,8 @@ def convert_mzml_to_mzduck(
         create_schema(
             conn,
             include_ms1=include_ms1,
-            include_ms2=include_ms2 or bool(msn_levels),
+            include_mgf=include_mgf,
+            include_ms2_detail=include_ms2_detail,
             msn_levels=msn_levels,
             mz_array_type=pre_scan["mz_array_storage_dtype"],
             intensity_array_type=pre_scan["intensity_array_storage_dtype"],
@@ -247,6 +262,8 @@ def convert_mzml_to_mzduck(
                 "intensity_array_storage_dtype": pre_scan[
                     "intensity_array_storage_dtype"
                 ],
+                "container_format": "duckdb",
+                "source_compression": source_compression_for_path(source),
                 "compression": compression,
                 "compression_level": str(compression_level),
                 "index_scan": "true" if index_scan else "false",
@@ -270,19 +287,22 @@ def convert_mzml_to_mzduck(
         batches = build_batches(
             conn=conn,
             include_ms1=include_ms1,
-            include_ms2=include_ms2,
+            include_mgf=include_mgf,
+            include_ms2_detail=include_ms2_detail,
             msn_levels=msn_levels,
             batch_size=batch_size,
             mz_storage_type=pre_scan["mz_array_storage_dtype"],
             intensity_storage_type=pre_scan["intensity_array_storage_dtype"],
-            include_text_overrides=(include_ms2 or bool(msn_levels)),
-            include_extra_params=(include_ms2 or bool(msn_levels)),
+            include_text_overrides=(include_ms2_detail or bool(msn_levels)),
+            include_extra_params=(include_ms2_detail or bool(msn_levels)),
         )
         inserted_counts = Counter()
         inserted_peak_counts = Counter()
         filter_detector = FilterStringDetector()
 
-        with mzml.MzML(str(source)) as reader:
+        with open_mzml_binary(source) as stream, mzml.MzML(
+            stream, **mzml_reader_kwargs(source)
+        ) as reader:
             for source_index, spectrum in enumerate(reader):
                 native_id = str(spectrum.get("id") or "")
                 scan_number = resolve_scan_number(spectrum, native_id, source_index)
@@ -314,9 +334,13 @@ def convert_mzml_to_mzduck(
                             ms1_row(record, mz_array, intensity_array)
                         )
                 elif ms_level == 2:
-                    if include_ms2:
+                    if include_mgf:
+                        batches["mgf"].append(
+                            mgf_row(record, mz_array, intensity_array)
+                        )
+                    if include_ms2_detail:
                         batches["ms2_spectra"].append(
-                            ms2_row(record, mz_array, intensity_array)
+                            ms2_detail_row(record)
                         )
                 else:
                     table_name = msn_table_name(ms_level)
@@ -336,7 +360,9 @@ def convert_mzml_to_mzduck(
             batch.flush()
 
         filter_encoding = filter_detector.encoding()
-        if filter_encoding != FILTER_STRING_ENCODING_RAW:
+        if filter_encoding != FILTER_STRING_ENCODING_RAW and table_exists(
+            conn, "spectrum_text_overrides"
+        ):
             conn.execute(
                 """
                 DELETE FROM spectrum_text_overrides
@@ -349,9 +375,11 @@ def convert_mzml_to_mzduck(
             expected_counts=inserted_counts,
             expected_peak_counts=inserted_peak_counts,
             include_ms1=include_ms1,
-            include_ms2=include_ms2,
+            include_mgf=include_mgf,
+            include_ms2_detail=include_ms2_detail,
             msn_levels=msn_levels,
         )
+        drop_empty_tables(conn)
         if index_scan:
             create_scan_index(conn)
 
@@ -434,18 +462,18 @@ def coerce_optional_scan(name, value):
 
 
 def validate_input_paths(source: Path, output: Path, *, overwrite: bool):
-    if source.suffix.lower() != ".mzml":
-        raise ValueError(f"Unsupported input format for mzDuck conversion: {source}")
-    if not source.exists():
-        raise FileNotFoundError(f"Input mzML does not exist: {source}")
-    if not source.is_file():
-        raise ValueError(f"Input mzML is not a file: {source}")
+    validate_input_source(source)
     if output.exists():
         if not overwrite:
             raise FileExistsError(f"Output already exists: {output}")
         output.unlink()
     if output.parent and not output.parent.exists():
         raise FileNotFoundError(f"Output directory does not exist: {output.parent}")
+
+
+def is_supported_mzml_path(source: Path):
+    text = source.name.lower()
+    return text.endswith(".mzml") or text.endswith(".mzml.gz")
 
 
 def make_staging_path(output: Path):
@@ -457,16 +485,85 @@ def make_compact_path(output: Path):
 
 
 def compact_database(staging: Path, compact: Path, output: Path):
-    safe_unlink(compact)
-    conn = duckdb.connect(str(compact))
-    try:
-        conn.execute(f"ATTACH '{staging}' AS src (READ_ONLY)")
-        database_name = conn.execute("PRAGMA database_list").fetchone()[1]
-        conn.execute(f'COPY FROM DATABASE src TO "{database_name}"')
-    finally:
-        conn.close()
+    safe_remove_database_artifacts(compact)
+    copy_result = run_compaction_subprocess(staging, compact, method="copy_from_database")
+    if copy_result.returncode != 0:
+        safe_remove_database_artifacts(compact)
+        fallback_result = run_compaction_subprocess(staging, compact, method="table_copy")
+        if fallback_result.returncode != 0:
+            raise RuntimeError(
+                "mzDuck compaction failed with both COPY FROM DATABASE and "
+                "table_copy fallback.\n"
+                f"COPY error:\n{copy_result.stdout or copy_result.stderr}\n"
+                f"Fallback error:\n{fallback_result.stdout or fallback_result.stderr}"
+            )
     validate_compacted_output(compact)
     os.replace(compact, output)
+
+
+def convert_mzml_to_parquet(
+    mzml_path,
+    output_path,
+    *,
+    overwrite=False,
+    batch_size=5000,
+    compression="zstd",
+    compression_level=6,
+    index_scan=False,
+    index_scan_number=False,
+    compute_sha256=True,
+    ms2_mgf_only=False,
+    no_ms1=False,
+    ms2_only=False,
+    ms1_only=False,
+    start_scan=None,
+    end_scan=None,
+    zip_output=False,
+):
+    source = Path(mzml_path)
+    output = Path(output_path)
+    validate_input_source(source)
+    prepare_output_target(output, overwrite=overwrite, expect_directory=not zip_output)
+
+    temp_db = output.with_name(f".{output.name}.parquet-source.{uuid.uuid4().hex}.mzduck")
+    temp_dir = output.with_name(f".{output.name}.parquet-staging.{uuid.uuid4().hex}")
+    try:
+        convert_mzml_to_mzduck(
+            source,
+            temp_db,
+            overwrite=True,
+            batch_size=batch_size,
+            compression=compression,
+            compression_level=compression_level,
+            index_scan=index_scan,
+            index_scan_number=index_scan_number,
+            compute_sha256=compute_sha256,
+            ms2_mgf_only=ms2_mgf_only,
+            no_ms1=no_ms1,
+            ms2_only=ms2_only,
+            ms1_only=ms1_only,
+            start_scan=start_scan,
+            end_scan=end_scan,
+        )
+        export_duckdb_to_parquet_container(
+            temp_db,
+            output,
+            compression=compression,
+            compression_level=compression_level,
+            zip_output=zip_output,
+            temp_dir=temp_dir,
+        )
+    except Exception:
+        if output.exists():
+            if output.is_dir():
+                shutil.rmtree(output, ignore_errors=True)
+            else:
+                output.unlink(missing_ok=True)
+        raise
+    finally:
+        safe_unlink(temp_db)
+        safe_rmtree(temp_dir)
+    return output
 
 
 def validate_compacted_output(path: Path):
@@ -489,6 +586,206 @@ def safe_unlink(path: Path):
         path.unlink()
     except FileNotFoundError:
         pass
+
+
+def safe_rmtree(path: Path):
+    if path.is_dir():
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def safe_remove_database_artifacts(path: Path):
+    safe_unlink(path)
+    safe_unlink(Path(str(path) + ".wal"))
+    safe_unlink(Path(str(path) + ".tmp"))
+
+
+def validate_input_source(source: Path):
+    if not is_supported_mzml_path(source):
+        raise ValueError(f"Unsupported input format for mzDuck conversion: {source}")
+    if not source.exists():
+        raise FileNotFoundError(f"Input mzML does not exist: {source}")
+    if not source.is_file():
+        raise ValueError(f"Input mzML is not a file: {source}")
+
+
+def run_compaction_subprocess(staging: Path, compact: Path, *, method: str):
+    script = textwrap.dedent(
+        """
+        import duckdb
+        import sys
+        from pathlib import Path
+
+        staging = Path(sys.argv[1])
+        compact = Path(sys.argv[2])
+        method = sys.argv[3]
+
+        def set_metadata(conn, key, value):
+            conn.execute("DELETE FROM run_metadata WHERE key = ?", [key])
+            conn.execute(
+                "INSERT INTO run_metadata(key, value) VALUES (?, ?)",
+                [key, value],
+            )
+
+        conn = duckdb.connect(str(compact))
+        try:
+            conn.execute(f"ATTACH '{str(staging).replace(\"'\", \"''\")}' AS src (READ_ONLY)")
+            if method == "copy_from_database":
+                database_name = conn.execute("PRAGMA database_list").fetchone()[1]
+                conn.execute(f'COPY FROM DATABASE src TO "{database_name}"')
+            elif method == "table_copy":
+                rows = conn.execute("SHOW TABLES FROM src").fetchall()
+                table_names = sorted(
+                    [name for (name,) in rows],
+                    key=lambda name: (name != "run_metadata", name),
+                )
+                for table_name in table_names:
+                    if table_name == "run_metadata":
+                        conn.execute(
+                            '''
+                            CREATE TABLE run_metadata (
+                                key VARCHAR PRIMARY KEY,
+                                value VARCHAR
+                            )
+                            '''
+                        )
+                        conn.execute(
+                            "INSERT INTO run_metadata SELECT * FROM src.run_metadata"
+                        )
+                    else:
+                        conn.execute(
+                            f"CREATE TABLE {table_name} AS SELECT * FROM src.{table_name}"
+                        )
+                metadata = dict(conn.execute("SELECT key, value FROM run_metadata").fetchall())
+                if metadata.get("index_scan") == "true" and "mgf" in table_names:
+                    conn.execute("CREATE INDEX idx_mgf_scan_number ON mgf(scan_number)")
+            else:
+                raise ValueError(f"Unknown compaction method: {method}")
+
+            set_metadata(conn, "compaction_method", method)
+        finally:
+            conn.close()
+        """
+    )
+    return subprocess.run(
+        [sys.executable, "-c", script, str(staging), str(compact), method],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def prepare_output_target(output: Path, *, overwrite: bool, expect_directory: bool):
+    if output.exists():
+        if not overwrite:
+            raise FileExistsError(f"Output already exists: {output}")
+        if output.is_dir():
+            shutil.rmtree(output)
+        else:
+            output.unlink()
+    parent = output.parent or Path(".")
+    if not parent.exists():
+        raise FileNotFoundError(f"Output directory does not exist: {parent}")
+    if expect_directory:
+        output.mkdir(parents=False, exist_ok=False)
+
+
+def export_duckdb_to_parquet_container(
+    database_path: Path,
+    output: Path,
+    *,
+    compression: str,
+    compression_level: int,
+    zip_output: bool,
+    temp_dir: Path,
+):
+    container_format = "parquet-zip" if zip_output else "parquet"
+    conn = duckdb.connect(str(database_path))
+    try:
+        upsert_metadata(conn, {"container_format": container_format})
+        conn.execute("CHECKPOINT")
+        if zip_output:
+            temp_dir.mkdir(parents=False, exist_ok=False)
+            export_physical_tables_to_parquet_dir(
+                conn,
+                temp_dir,
+                compression=compression,
+                compression_level=compression_level,
+            )
+            write_parquet_zip(temp_dir, output)
+        else:
+            export_physical_tables_to_parquet_dir(
+                conn,
+                output,
+                compression=compression,
+                compression_level=compression_level,
+            )
+    finally:
+        conn.close()
+
+
+def export_physical_tables_to_parquet_dir(
+    conn,
+    output_dir: Path,
+    *,
+    compression: str,
+    compression_level: int,
+):
+    for table_name in physical_relation_names(conn):
+        parquet_path = output_dir / f"{table_name}.parquet"
+        copy_relation_to_parquet(
+            conn,
+            table_name,
+            parquet_path,
+            compression=compression,
+            compression_level=compression_level,
+        )
+
+
+def write_parquet_zip(source_dir: Path, output: Path):
+    with zipfile.ZipFile(output, mode="w", compression=zipfile.ZIP_STORED) as archive:
+        for parquet_path in sorted(source_dir.glob("*.parquet")):
+            archive.write(parquet_path, arcname=parquet_path.name)
+
+
+def physical_relation_names(conn):
+    names = ["run_metadata"]
+    names.extend(data_table_names(conn))
+    names.extend(
+        table_name
+        for table_name in ("spectrum_text_overrides", "spectrum_extra_params")
+        if table_exists(conn, table_name)
+    )
+    return [table_name for table_name in names if relation_type(conn, table_name) == "BASE TABLE"]
+
+
+def copy_relation_to_parquet(
+    conn,
+    table_name: str,
+    output_path: Path,
+    *,
+    compression: str,
+    compression_level: int,
+):
+    sql = (
+        f"COPY {table_name} TO '{duckdb_sql_string(output_path)}' "
+        f"({parquet_copy_options(compression, compression_level)})"
+    )
+    conn.execute(sql)
+
+
+def parquet_copy_options(compression: str, compression_level: int):
+    options = ["FORMAT PARQUET"]
+    compression = validate_compression(compression)
+    if compression == "zstd":
+        options.append("COMPRESSION 'zstd'")
+        options.append(f"COMPRESSION_LEVEL {int(compression_level)}")
+    elif compression == "uncompressed":
+        options.append("COMPRESSION 'uncompressed'")
+    return ", ".join(options)
+
+
+def duckdb_sql_string(value):
+    return str(value).replace("'", "''")
 
 
 def validate_compression(value):
@@ -543,17 +840,21 @@ def pre_scan_mzml(source: Path, options: dict) -> dict:
     included_peak_counts = Counter()
     included_scan_numbers = set()
 
-    with mzml.MzML(str(source)) as reader:
+    with open_mzml_binary(source) as stream, mzml.MzML(
+        stream, decode_binary=False, **mzml_reader_kwargs(source)
+    ) as reader:
         for source_index, spectrum in enumerate(reader):
             ms_level = as_int(spectrum.get("ms level"))
             if ms_level is None:
                 raise ValueError(f"Spectrum {source_index} is missing ms level")
             native_id = str(spectrum.get("id") or "")
             scan_number = resolve_scan_number(spectrum, native_id, source_index)
-            mz_array, intensity_array = required_arrays(spectrum, source_index)
+            mz_dtype, intensity_dtype, peak_count = required_array_metadata(
+                spectrum, source_index
+            )
 
             source_counts[ms_level] += 1
-            source_peak_counts[ms_level] += len(mz_array)
+            source_peak_counts[ms_level] += peak_count
             if not include_spectrum(ms_level, scan_number, options):
                 continue
 
@@ -563,10 +864,10 @@ def pre_scan_mzml(source: Path, options: dict) -> dict:
                 )
             included_scan_numbers.add(scan_number)
 
-            mz_dtypes.add(str(mz_array.dtype))
-            intensity_dtypes.add(str(intensity_array.dtype))
+            mz_dtypes.add(str(np.dtype(mz_dtype)))
+            intensity_dtypes.add(str(np.dtype(intensity_dtype)))
             included_counts[ms_level] += 1
-            included_peak_counts[ms_level] += len(mz_array)
+            included_peak_counts[ms_level] += peak_count
 
             scan = first_nested(spectrum, "scanList", "scan", 0)
             if scan is None or "scan start time" not in scan:
@@ -678,6 +979,12 @@ def include_spectrum(ms_level, scan_number, options):
     return ms_level >= 1
 
 
+def mzml_reader_kwargs(source: Path):
+    if source_compression_for_path(source) == "gzip":
+        return {"use_index": False}
+    return {}
+
+
 def required_arrays(spectrum, source_index):
     if "m/z array" not in spectrum or "intensity array" not in spectrum:
         raise ValueError(f"Spectrum {source_index} is missing required arrays")
@@ -689,6 +996,35 @@ def required_arrays(spectrum, source_index):
             f"{len(mz_array)} != {len(intensity_array)}"
         )
     return mz_array, intensity_array
+
+
+def required_array_metadata(spectrum, source_index):
+    if "m/z array" not in spectrum or "intensity array" not in spectrum:
+        raise ValueError(f"Spectrum {source_index} is missing required arrays")
+    mz_array = spectrum["m/z array"]
+    intensity_array = spectrum["intensity array"]
+    mz_dtype = getattr(mz_array, "dtype", None)
+    intensity_dtype = getattr(intensity_array, "dtype", None)
+    if mz_dtype is None or intensity_dtype is None:
+        decoded_mz = np.asarray(mz_array)
+        decoded_intensity = np.asarray(intensity_array)
+        if len(decoded_mz) != len(decoded_intensity):
+            raise ValueError(
+                f"Spectrum {source_index} has mismatched m/z and intensity lengths: "
+                f"{len(decoded_mz)} != {len(decoded_intensity)}"
+            )
+        return decoded_mz.dtype, decoded_intensity.dtype, len(decoded_mz)
+    peak_count = as_int(spectrum.get("defaultArrayLength"))
+    if peak_count is None:
+        decoded_mz = np.asarray(mz_array)
+        decoded_intensity = np.asarray(intensity_array)
+        if len(decoded_mz) != len(decoded_intensity):
+            raise ValueError(
+                f"Spectrum {source_index} has mismatched m/z and intensity lengths: "
+                f"{len(decoded_mz)} != {len(decoded_intensity)}"
+            )
+        peak_count = len(decoded_mz)
+    return mz_dtype, intensity_dtype, peak_count
 
 
 def storage_type_for_dtypes(dtypes, label):
@@ -916,11 +1252,15 @@ def ms1_row(record, mz_array, intensity_array):
     return row
 
 
-def ms2_row(record, mz_array, intensity_array):
-    row = {column: record[column] for column in MS2_COLUMNS if column in record}
+def mgf_row(record, mz_array, intensity_array):
+    row = {column: record[column] for column in MGF_COLUMNS if column in record}
     row["mz_array"] = mz_array
     row["intensity_array"] = intensity_array
     return row
+
+
+def ms2_detail_row(record):
+    return {column: record[column] for column in MS2_COLUMNS if column in record}
 
 
 def msn_row(record, mz_array, intensity_array):
@@ -999,10 +1339,17 @@ class TableBatch:
         self.mz_storage_type = mz_storage_type
         self.intensity_storage_type = intensity_storage_type
         self.rows = []
+        self.has_arrays = "mz_array" in self.columns and "intensity_array" in self.columns
+        self.array_value_count = 0
 
     def append(self, row):
         self.rows.append(row)
-        if len(self.rows) >= self.batch_size:
+        if self.has_arrays:
+            self.array_value_count += len(row["mz_array"])
+        if (
+            len(self.rows) >= self.batch_size
+            or (self.has_arrays and self.array_value_count >= MAX_ARRAY_VALUES_PER_BATCH)
+        ):
             self.flush()
 
     def flush(self):
@@ -1035,13 +1382,15 @@ class TableBatch:
         finally:
             self.conn.unregister(view_name)
         self.rows.clear()
+        self.array_value_count = 0
 
 
 def build_batches(
     *,
     conn,
     include_ms1,
-    include_ms2,
+    include_mgf,
+    include_ms2_detail,
     msn_levels,
     batch_size,
     mz_storage_type,
@@ -1059,7 +1408,16 @@ def build_batches(
             mz_storage_type=mz_storage_type,
             intensity_storage_type=intensity_storage_type,
         )
-    if include_ms2:
+    if include_mgf:
+        batches["mgf"] = TableBatch(
+            conn,
+            "mgf",
+            MGF_COLUMNS,
+            batch_size=batch_size,
+            mz_storage_type=mz_storage_type,
+            intensity_storage_type=intensity_storage_type,
+        )
+    if include_ms2_detail:
         batches["ms2_spectra"] = TableBatch(
             conn,
             "ms2_spectra",
@@ -1122,7 +1480,8 @@ def validate_import(
     expected_counts,
     expected_peak_counts,
     include_ms1,
-    include_ms2,
+    include_mgf,
+    include_ms2_detail,
     msn_levels,
 ):
     if include_ms1:
@@ -1132,12 +1491,23 @@ def validate_import(
             expected_counts.get(1, 0),
             expected_peak_counts.get(1, 0),
         )
-    if include_ms2:
+    if include_mgf:
         validate_array_table(
+            conn,
+            "mgf",
+            expected_counts.get(2, 0),
+            expected_peak_counts.get(2, 0),
+        )
+        duplicates = conn.execute(
+            "SELECT COUNT(*) - COUNT(DISTINCT scan_number) FROM mgf"
+        ).fetchone()[0]
+        if duplicates:
+            raise ValueError(f"{duplicates} duplicate scan_number values in mgf")
+    if include_ms2_detail:
+        validate_scalar_table(
             conn,
             "ms2_spectra",
             expected_counts.get(2, 0),
-            expected_peak_counts.get(2, 0),
         )
         duplicates = conn.execute(
             "SELECT COUNT(*) - COUNT(DISTINCT scan_number) FROM ms2_spectra"
@@ -1146,10 +1516,10 @@ def validate_import(
             raise ValueError(
                 f"{duplicates} duplicate scan_number values in ms2_spectra"
             )
-        mgf_count = conn.execute("SELECT COUNT(*) FROM mgf").fetchone()[0]
+        mgf_count = table_count(conn, "mgf")
         if mgf_count != expected_counts.get(2, 0):
             raise ValueError(
-                f"mgf compatibility view count mismatch: {mgf_count} != "
+                f"mgf table count mismatch: {mgf_count} != "
                 f"{expected_counts.get(2, 0)}"
             )
     for level in msn_levels:
@@ -1186,6 +1556,31 @@ def validate_array_table(conn, table_name, expected_spectrum_count, expected_pea
     ).fetchone()[0]
     if mismatched:
         raise ValueError(f"{mismatched} spectra in {table_name} have mismatched arrays")
+
+
+def validate_scalar_table(conn, table_name, expected_spectrum_count):
+    count = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
+    if count != expected_spectrum_count:
+        raise ValueError(
+            f"Imported {table_name} count mismatch: {count} != "
+            f"{expected_spectrum_count}"
+        )
+
+
+def drop_empty_tables(conn):
+    rows = conn.execute(
+        """
+        SELECT table_name
+        FROM information_schema.tables
+        WHERE table_schema = 'main'
+          AND table_type = 'BASE TABLE'
+          AND table_name <> 'run_metadata'
+        ORDER BY table_name
+        """
+    ).fetchall()
+    for (table_name,) in rows:
+        if table_count(conn, table_name) == 0:
+            conn.execute(f"DROP TABLE {table_name}")
 
 
 def build_summary_metadata(

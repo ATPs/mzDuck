@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from .reconstruction import mgf_title_for_scan
 from .schema import table_exists
 
 
@@ -43,7 +44,7 @@ def export_mgf(conn, output_path, *, overwrite=False):
     cursor = conn.execute(
         """
         SELECT
-            title,
+            scan_number,
             rt,
             precursor_mz,
             precursor_intensity,
@@ -61,7 +62,7 @@ def export_mgf(conn, output_path, *, overwrite=False):
             if row is None:
                 break
             (
-                title,
+                scan_number,
                 rt,
                 precursor_mz,
                 precursor_intensity,
@@ -69,6 +70,7 @@ def export_mgf(conn, output_path, *, overwrite=False):
                 mz_array,
                 intensity_array,
             ) = row
+            title = mgf_title_for_scan(metadata, scan_number, precursor_charge)
             handle.write("BEGIN IONS\n")
             handle.write(f"TITLE={title}\n")
             if precursor_mz is not None:

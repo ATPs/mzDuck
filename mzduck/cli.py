@@ -7,6 +7,7 @@ import json
 import sys
 
 from .file import MzDuckFile
+from .import_mzml import convert_mzml_to_parquet
 
 
 class HelpFormatter(argparse.RawDescriptionHelpFormatter, argparse.ArgumentDefaultsHelpFormatter):
@@ -14,12 +15,14 @@ class HelpFormatter(argparse.RawDescriptionHelpFormatter, argparse.ArgumentDefau
 
 
 MAIN_DESCRIPTION = """\
-mzDuck stores centroid mzML spectra in a DuckDB-backed .mzduck file.
+mzDuck stores centroid mzML spectra in a compact relational container.
 
-The v2 layout keeps one canonical MS2 storage table, exposes an MGF
-compatibility view for SQL and export, stores sparse exact text fallbacks when
-reconstruction is not trustworthy, and writes the final database through a
-fresh-file compact-copy step so the on-disk file stays small.
+The default container is DuckDB-backed `.mzduck`, but `mzduck convert` can also
+write physical tables as Parquet files in a folder or in an uncompressed zip.
+The v2 layout stores MS2 payload in a physical `mgf` table, keeps richer mzML
+detail in `ms2_spectra` when requested, stores sparse exact fallbacks only when
+reconstruction is not exact, and writes DuckDB output through a fresh-file
+compact-copy step so the final file stays small.
 """
 
 
@@ -27,18 +30,21 @@ MAIN_EPILOG = """\
 Layout:
   run_metadata
     run-level provenance, header fragments, templates, filter-string policy,
-    counts, and table registry.
+    counts, table registry, `container_format`, and `source_compression`.
+  mgf
+    physical MS2 payload table. It stores scan_number, source order, RT,
+    precursor payload, and peak arrays.
   ms1_spectra
     physical MS1 spectra plus arrays when MS1 is included.
   ms2_spectra
-    canonical physical MS2 spectra plus arrays. This is the v2 storage anchor.
-  mgf
-    derived compatibility view with computed TITLE values. It is queryable and
-    exportable, but it is not physically stored in v2.
+    physical MS2 detail-only table keyed by scan_number. It stores mzML detail
+    that is not part of the MGF-native payload.
   spectrum_text_overrides
     sparse exact text fallbacks for native_id, spectrum_ref, and filter_string.
+    Empty optional tables are omitted from final output.
   spectrum_extra_params
     mzML params not covered by typed columns, grouped by scope.
+    Empty optional tables are omitted from final output.
 
 Reconstructed vs stored fields:
   TITLE is always derived from run metadata plus scan_number/charge.
@@ -47,20 +53,28 @@ Reconstructed vs stored fields:
   filter_string uses per-run encoder detection. An encoder is accepted only
   when it reproduces every selected spectrum exactly. If not, mzDuck stores the
   original strings instead of inventing an approximate rule.
+  In `--ms2-mgf-only`, only the MGF-native payload is stored. That mode keeps
+  `run_metadata` plus physical `mgf` and intentionally omits richer mzML
+  detail tables.
 
 Compaction:
-  mzDuck writes to a staging DuckDB file and then copies the database into a
-  fresh final file. This avoids carrying free blocks from the first write and
-  is part of the normal v2 output path.
+  mzDuck writes DuckDB output to a staging database and then copies into a
+  fresh final file. Parquet output modes export only physical relations that
+  are actually present, and empty optional tables are omitted there too.
 
 Round-trip scope:
   mzDuck targets semantic round-trip for supported centroid mzML content.
   Exported mzML is not expected to be byte-identical XML, but typed fields,
   templates, exact text overrides, and stored extra params are used to keep the
-  reconstructed spectra faithful to the source run.
+  reconstructed spectra faithful to the source run when detail tables are
+  present. `--ms2-mgf-only` preserves the MGF-native contract, not full mzML
+  detail.
 
 Examples:
   mzduck convert input.mzML -o output.mzduck --overwrite
+  mzduck convert input.mzML.gz -o output.mzduck --overwrite
+  mzduck convert input.mzML.gz -o out-dir --parquet --overwrite
+  mzduck convert input.mzML.gz -o out.parquet.zip --parquet-zip --overwrite
   mzduck convert input.withMS1.mzML -o output.mzduck --index-scan
   mzduck convert input.mzML -o output.mzduck --ms2-mgf-only --start-scan 100 --end-scan 500
   mzduck convert input.withMS1.mzML -o ms1-only.mzduck --ms1-only
@@ -86,13 +100,13 @@ mzML precision flags for export-mzml:
   --inten64  write only intensity arrays as 64-bit floats
 
 Defaults:
-  Default convert mode keeps canonical MS2 storage, MS1 when present, MSn when
-  present, run_metadata, and the v2 fallback tables.
-  In v2, --ms2-mgf-only and --ms2-only both produce an MS2-only compact file.
-  The difference is mainly user intent and metadata; the old physical mgf-only
-  split no longer exists because mgf is derived from canonical MS2 storage.
-  --index-scan creates idx_mgf_scan_number on the canonical MS2 table so exact
-  scan lookups through the mgf compatibility view stay fast.
+  Default convert mode keeps physical `mgf`, detail `ms2_spectra`, MS1 when
+  present, MSn when present, run_metadata, and non-empty fallback tables.
+  --ms2-only keeps `run_metadata`, physical `mgf`, detail `ms2_spectra`, and
+  any non-empty fallback tables.
+  --ms2-mgf-only keeps only `run_metadata` and physical `mgf`.
+  --index-scan creates `idx_mgf_scan_number` on `mgf(scan_number)` so exact
+  scan lookups stay fast.
   mzDuck stores peak arrays in the source dtype where possible.
   mzML export defaults to the stored/source dtype unless precision flags are used.
 """
@@ -109,44 +123,54 @@ def build_parser():
 
     convert = subparsers.add_parser(
         "convert",
-        help="convert mzML to mzDuck",
+        help="convert mzML to mzDuck or Parquet",
         formatter_class=HelpFormatter,
-        description="Convert one centroid mzML file into one .mzduck file.",
+        description="Convert one centroid mzML or mzML.gz file into DuckDB-backed mzDuck or physical Parquet output.",
         epilog="""\
 Examples:
   mzduck convert input.mzML -o output.mzduck --overwrite
+  mzduck convert input.mzML.gz -o output.mzduck --overwrite
   mzduck convert input.withMS1.mzML -o output.mzduck --index-scan
   mzduck convert input.mzML -o mgf-only.mzduck --ms2-mgf-only --overwrite
+  mzduck convert input.mzML.gz -o out-dir --parquet --overwrite
+  mzduck convert input.mzML.gz -o out.parquet.zip --parquet-zip --overwrite
   mzduck convert input.withMS1.mzML -o no-ms1.mzduck --no-ms1
   mzduck convert input.withMS1.mzML -o scan-window.mzduck --start-scan 1000 --end-scan 2000
   mzduck convert mzduck/example_data/tiny.mzML /tmp/tiny.mzduck --batch-size 1 --no-sha256
 
 Table modes:
-  default         run_metadata, canonical ms2_spectra, derived mgf view,
-                  MS1 when present, and MSn tables when present
-  --ms2-mgf-only  MS2-only compact v2 file; mgf remains a derived view
-  --ms2-only      MS2-only compact v2 file; equivalent storage shape to
-                  --ms2-mgf-only in v2
+  default         run_metadata, physical mgf, detail ms2_spectra,
+                  MS1 when present, MSn tables when present, and non-empty
+                  fallback tables
+  --ms2-mgf-only  run_metadata plus physical mgf only
+  --ms2-only      run_metadata, physical mgf, detail ms2_spectra, and any
+                  non-empty fallback tables
   --ms1-only      run_metadata plus ms1_spectra only
+
+Container modes:
+  default         write one DuckDB-backed .mzduck file
+  --parquet       write one parquet file per physical relation into a folder
+  --parquet-zip   write the same parquet members into one zip file with no
+                  zip-level compression
 """,
     )
-    convert.add_argument("input_mzml", metavar="input.mzML")
-    convert.add_argument("output_mzduck", nargs="?", metavar="output.mzduck")
-    convert.add_argument("-o", "--out", dest="out", metavar="output.mzduck")
-    convert.add_argument("--overwrite", action="store_true", help="replace an existing output file")
+    convert.add_argument("input_mzml", metavar="input.mzML[.gz]")
+    convert.add_argument("output_mzduck", nargs="?", metavar="output")
+    convert.add_argument("-o", "--out", dest="out", metavar="output")
+    convert.add_argument("--overwrite", action="store_true", help="replace an existing output file or folder")
     convert.add_argument("--batch-size", type=int, default=5000, help="number of spectra per insert batch")
     convert.add_argument("--no-sha256", action="store_true", help="skip source file SHA-256 hashing")
     convert.add_argument(
         "--compression",
         choices=["zstd", "auto", "uncompressed"],
         default="zstd",
-        help="force DuckDB column compression before writing",
+        help="compression policy for DuckDB output and Parquet members",
     )
     convert.add_argument(
         "--compression-level",
         type=int,
         default=6,
-        help="requested zstd compression level, recorded if DuckDB ignores it",
+        help="requested zstd compression level when zstd is used",
     )
     convert.add_argument(
         "--index-scan-number",
@@ -156,13 +180,24 @@ Table modes:
     convert.add_argument(
         "--index-scan",
         action="store_true",
-        help="create idx_mgf_scan_number on canonical ms2_spectra(scan_number)",
+        help="create idx_mgf_scan_number on physical mgf(scan_number)",
+    )
+    container = convert.add_argument_group("container selection")
+    container.add_argument(
+        "--parquet",
+        action="store_true",
+        help="write one parquet file per physical relation into an output folder",
+    )
+    container.add_argument(
+        "--parquet-zip",
+        action="store_true",
+        help="write parquet members into one uncompressed zip archive",
     )
     mode = convert.add_argument_group("table selection")
     mode.add_argument(
         "--ms2-mgf-only",
         action="store_true",
-        help="build an MS2-only compact v2 file with a derived mgf view",
+        help="build an MS2-only compact file with run_metadata plus physical mgf only",
     )
     mode.add_argument(
         "--no-ms1",
@@ -172,7 +207,7 @@ Table modes:
     mode.add_argument(
         "--ms2-only",
         action="store_true",
-        help="build an MS2-only compact v2 file with canonical ms2_spectra storage",
+        help="build an MS2-only compact file with physical mgf plus detail ms2_spectra",
     )
     mode.add_argument(
         "--ms1-only",
@@ -196,7 +231,7 @@ Table modes:
         formatter_class=HelpFormatter,
         description=(
             "Export spectra from a .mzduck file to Mascot Generic Format using "
-            "the public mgf compatibility view."
+            "the physical mgf table."
         ),
         epilog="""\
 Examples:
@@ -204,8 +239,8 @@ Examples:
   mzduck export-mgf mzduck/example_data/tiny.mzduck /tmp/tiny.mgf
 
 Notes:
-  In v2 the mgf relation is a derived view, not a stored base table.
-  TITLE values are reconstructed from run metadata and scan_number/charge.
+  In v2 the mgf relation is a stored base table.
+  TITLE values are always reconstructed from run metadata and scan_number/charge.
 """,
     )
     export_mgf.add_argument("input_mzduck", metavar="input.mzduck")
@@ -231,7 +266,8 @@ Examples:
 Notes:
   native_id, spectrum_ref, and filter_string may be reconstructed from
   templates/encoders or taken from exact stored overrides when no exact rule
-  exists for that file.
+  exists for that file. In `--ms2-mgf-only`, export uses the physical mgf
+  payload and whatever run-level reconstruction metadata is still available.
 """,
     )
     export_mzml.add_argument("input_mzduck", metavar="input.mzduck")
@@ -255,8 +291,8 @@ Examples:
 
 Notes:
   v2 stores summary counts in run_metadata instead of a physical
-  spectrum_summary table. The inspect command reports the derived view of the
-  file layout regardless of storage version.
+  spectrum_summary table. It also omits empty optional tables from the final
+  file, so inspect reports only the physical relations that actually remain.
 """,
     )
     inspect.add_argument("input_mzduck", metavar="input.mzduck")
@@ -317,25 +353,47 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         if args.command == "convert":
+            if args.parquet and args.parquet_zip:
+                parser.error("--parquet and --parquet-zip cannot be used together")
             output = resolve_output(args, "output_mzduck", parser)
-            handle = MzDuckFile.from_mzml(
-                args.input_mzml,
-                output,
-                overwrite=args.overwrite,
-                batch_size=args.batch_size,
-                compression=args.compression,
-                compression_level=args.compression_level,
-                index_scan=args.index_scan,
-                index_scan_number=args.index_scan_number,
-                compute_sha256=not args.no_sha256,
-                ms2_mgf_only=args.ms2_mgf_only,
-                no_ms1=args.no_ms1,
-                ms2_only=args.ms2_only,
-                ms1_only=args.ms1_only,
-                start_scan=args.start_scan,
-                end_scan=args.end_scan,
-            )
-            handle.close()
+            if args.parquet or args.parquet_zip:
+                convert_mzml_to_parquet(
+                    args.input_mzml,
+                    output,
+                    overwrite=args.overwrite,
+                    batch_size=args.batch_size,
+                    compression=args.compression,
+                    compression_level=args.compression_level,
+                    index_scan=args.index_scan,
+                    index_scan_number=args.index_scan_number,
+                    compute_sha256=not args.no_sha256,
+                    ms2_mgf_only=args.ms2_mgf_only,
+                    no_ms1=args.no_ms1,
+                    ms2_only=args.ms2_only,
+                    ms1_only=args.ms1_only,
+                    start_scan=args.start_scan,
+                    end_scan=args.end_scan,
+                    zip_output=args.parquet_zip,
+                )
+            else:
+                handle = MzDuckFile.from_mzml(
+                    args.input_mzml,
+                    output,
+                    overwrite=args.overwrite,
+                    batch_size=args.batch_size,
+                    compression=args.compression,
+                    compression_level=args.compression_level,
+                    index_scan=args.index_scan,
+                    index_scan_number=args.index_scan_number,
+                    compute_sha256=not args.no_sha256,
+                    ms2_mgf_only=args.ms2_mgf_only,
+                    no_ms1=args.no_ms1,
+                    ms2_only=args.ms2_only,
+                    ms1_only=args.ms1_only,
+                    start_scan=args.start_scan,
+                    end_scan=args.end_scan,
+                )
+                handle.close()
             return 0
         if args.command == "export-mgf":
             output = resolve_output(args, "output_mgf", parser)

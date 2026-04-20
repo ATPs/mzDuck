@@ -19,6 +19,17 @@ CREATE TABLE run_metadata (
 
 MGF_COLUMNS = [
     "scan_number",
+    "source_index",
+    "rt",
+    "precursor_mz",
+    "precursor_intensity",
+    "precursor_charge",
+    "mz_array",
+    "intensity_array",
+]
+
+V1_MGF_COLUMNS = [
+    "scan_number",
     "title",
     "rt",
     "precursor_mz",
@@ -27,6 +38,19 @@ MGF_COLUMNS = [
     "mz_array",
     "intensity_array",
 ]
+
+MGF_DDL_TEMPLATE = """
+CREATE TABLE mgf (
+    scan_number          INTEGER NOT NULL,
+    source_index         INTEGER NOT NULL,
+    rt                   FLOAT NOT NULL,
+    precursor_mz         DOUBLE,
+    precursor_intensity  FLOAT,
+    precursor_charge     TINYINT,
+    mz_array             {mz_array_type}[] NOT NULL,
+    intensity_array      {intensity_array_type}[] NOT NULL
+)
+"""
 
 MS1_COLUMNS = [
     "scan_number",
@@ -96,13 +120,7 @@ V1_MS2_COLUMNS = [
 
 MS2_COLUMNS = [
     "scan_number",
-    "source_index",
     "instrument_configuration_ref",
-    "ms_level",
-    "rt",
-    "precursor_mz",
-    "precursor_charge",
-    "precursor_intensity",
     "collision_energy",
     "activation_type",
     "isolation_window_target",
@@ -118,20 +136,12 @@ MS2_COLUMNS = [
     "monoisotopic_mz",
     "scan_window_lower",
     "scan_window_upper",
-    "mz_array",
-    "intensity_array",
 ]
 
 MS2_DDL_TEMPLATE = """
 CREATE TABLE ms2_spectra (
     scan_number                INTEGER NOT NULL,
-    source_index               INTEGER NOT NULL,
     instrument_configuration_ref VARCHAR,
-    ms_level                   UTINYINT NOT NULL,
-    rt                         FLOAT NOT NULL,
-    precursor_mz               DOUBLE,
-    precursor_charge           TINYINT,
-    precursor_intensity        FLOAT,
     collision_energy           FLOAT,
     activation_type            VARCHAR,
     isolation_window_target    DOUBLE,
@@ -147,8 +157,7 @@ CREATE TABLE ms2_spectra (
     monoisotopic_mz            DOUBLE,
     scan_window_lower          FLOAT,
     scan_window_upper          FLOAT,
-    mz_array                   {mz_array_type}[] NOT NULL,
-    intensity_array            {intensity_array_type}[] NOT NULL
+    PRIMARY KEY(scan_number)
 )
 """
 
@@ -296,7 +305,7 @@ SPECTRUM_SUMMARY_COLUMNS = [
     "included_in_mgf",
 ]
 
-INDEX_MGF_SCAN_SQL = "CREATE INDEX idx_mgf_scan_number ON ms2_spectra(scan_number)"
+INDEX_MGF_SCAN_SQL = "CREATE INDEX idx_mgf_scan_number ON mgf(scan_number)"
 MSN_TABLE_RE = re.compile(r"^ms([3-9]\d*)_spectra$")
 
 
@@ -304,13 +313,14 @@ def create_schema(
     conn,
     *,
     include_ms1: bool,
-    include_ms2: bool,
+    include_mgf: bool,
+    include_ms2_detail: bool,
     msn_levels=(),
     mz_array_type="FLOAT",
     intensity_array_type="FLOAT",
 ):
-    """Create the selected mzDuck v2 tables and compatibility views."""
-    include_text_support = include_ms2 or bool(tuple(msn_levels))
+    """Create the selected mzDuck v2 tables."""
+    include_text_support = include_ms2_detail or bool(tuple(msn_levels))
     conn.execute(RUN_METADATA_DDL)
     if include_ms1:
         create_ms1_table(
@@ -318,7 +328,13 @@ def create_schema(
             mz_array_type=mz_array_type,
             intensity_array_type=intensity_array_type,
         )
-    if include_ms2:
+    if include_mgf:
+        create_mgf_table(
+            conn,
+            mz_array_type=mz_array_type,
+            intensity_array_type=intensity_array_type,
+        )
+    if include_ms2_detail:
         create_ms2_table(
             conn,
             mz_array_type=mz_array_type,
@@ -334,8 +350,15 @@ def create_schema(
     if include_text_support:
         create_text_override_table(conn)
         create_extra_param_table(conn)
-    if include_ms2:
-        create_mgf_view(conn)
+
+
+def create_mgf_table(conn, *, mz_array_type="FLOAT", intensity_array_type="FLOAT"):
+    conn.execute(
+        MGF_DDL_TEMPLATE.format(
+            mz_array_type=normalize_storage_type(mz_array_type),
+            intensity_array_type=normalize_storage_type(intensity_array_type),
+        )
+    )
 
 
 def create_ms1_table(conn, *, mz_array_type="FLOAT", intensity_array_type="FLOAT"):
@@ -377,40 +400,9 @@ def create_extra_param_table(conn):
     conn.execute(EXTRA_PARAM_DDL)
 
 
-def create_mgf_view(conn):
-    conn.execute(
-        """
-        CREATE VIEW mgf AS
-        WITH meta AS (
-            SELECT
-                COALESCE(
-                    MAX(CASE WHEN key = 'mgf_title_source' THEN value END),
-                    'mzduck'
-                ) AS mgf_title_source
-            FROM run_metadata
-        )
-        SELECT
-            s.scan_number,
-            meta.mgf_title_source || '.'
-                || CAST(s.scan_number AS VARCHAR) || '.'
-                || CAST(s.scan_number AS VARCHAR) || '.'
-                || CAST(COALESCE(s.precursor_charge, 0) AS VARCHAR) AS title,
-            s.rt,
-            s.precursor_mz,
-            s.precursor_intensity,
-            s.precursor_charge,
-            s.mz_array,
-            s.intensity_array
-        FROM ms2_spectra s
-        CROSS JOIN meta
-        WHERE s.ms_level = 2
-        """
-    )
-
-
 def create_scan_index(conn):
-    """Create the optional scan-number index for the MGF compatibility view."""
-    if base_table_exists(conn, "ms2_spectra"):
+    """Create the optional scan-number index for the physical MGF table."""
+    if base_table_exists(conn, "mgf"):
         conn.execute(INDEX_MGF_SCAN_SQL)
 
 
@@ -521,7 +513,7 @@ def validate_v1_schema(conn):
     if not data_tables:
         raise ValueError("mzDuck file does not contain a data table")
     if "mgf" in data_tables:
-        missing = set(MGF_COLUMNS) - set(get_table_columns(conn, "mgf"))
+        missing = set(V1_MGF_COLUMNS) - set(get_table_columns(conn, "mgf"))
         if missing:
             raise ValueError("Missing mgf column(s): " + ", ".join(sorted(missing)))
     if "ms1_spectra" in data_tables:
@@ -550,6 +542,10 @@ def validate_v2_schema(conn):
     base_tables = {name for name in data_table_names(conn) if base_table_exists(conn, name)}
     if not base_tables:
         raise ValueError("mzDuck file does not contain a base data table")
+    if "mgf" in base_tables:
+        missing = set(MGF_COLUMNS) - set(get_table_columns(conn, "mgf"))
+        if missing:
+            raise ValueError("Missing mgf column(s): " + ", ".join(sorted(missing)))
     if "ms1_spectra" in base_tables:
         missing = set(V2_REQUIRED_MS1_COLUMNS) - set(
             get_table_columns(conn, "ms1_spectra")
@@ -566,17 +562,8 @@ def validate_v2_schema(conn):
             raise ValueError(
                 "Missing ms2_spectra column(s): " + ", ".join(sorted(missing))
             )
-        if not table_exists(conn, "mgf"):
-            raise ValueError("Missing required compatibility view: mgf")
-        missing = set(MGF_COLUMNS) - set(get_table_columns(conn, "mgf"))
-        if missing:
-            raise ValueError(
-                "Missing mgf compatibility column(s): " + ", ".join(sorted(missing))
-            )
-        if not base_table_exists(conn, "spectrum_text_overrides"):
-            raise ValueError("Missing required v2 table: spectrum_text_overrides")
-        if not base_table_exists(conn, "spectrum_extra_params"):
-            raise ValueError("Missing required v2 table: spectrum_extra_params")
+        if not base_table_exists(conn, "mgf"):
+            raise ValueError("Missing required v2 base table: mgf")
     for table_name in base_tables:
         if MSN_TABLE_RE.match(table_name):
             missing = set(V2_REQUIRED_MSN_COLUMNS) - set(
@@ -587,6 +574,24 @@ def validate_v2_schema(conn):
                     f"Missing {table_name} column(s): "
                     + ", ".join(sorted(missing))
                 )
+    if base_table_exists(conn, "spectrum_text_overrides"):
+        missing = set(TEXT_OVERRIDE_COLUMNS) - set(
+            get_table_columns(conn, "spectrum_text_overrides")
+        )
+        if missing:
+            raise ValueError(
+                "Missing spectrum_text_overrides column(s): "
+                + ", ".join(sorted(missing))
+            )
+    if base_table_exists(conn, "spectrum_extra_params"):
+        missing = set(EXTRA_PARAM_COLUMNS) - set(
+            get_table_columns(conn, "spectrum_extra_params")
+        )
+        if missing:
+            raise ValueError(
+                "Missing spectrum_extra_params column(s): "
+                + ", ".join(sorted(missing))
+            )
 
 
 def upsert_metadata(conn, metadata):
@@ -674,13 +679,13 @@ def registry_entry(conn, table_name, indexed_by_table):
     ms_level = None
     if table_name == "mgf":
         ms_level = 2
-        role = "derived MGF compatibility view"
+        role = "physical MS2 payload table"
     elif table_name == "ms1_spectra":
         ms_level = 1
         role = "MS1 spectra and peaks"
     elif table_name == "ms2_spectra":
         ms_level = 2
-        role = "canonical MS2 spectra and peaks"
+        role = "MS2 detail-only metadata"
     elif table_name == "spectrum_text_overrides":
         role = "sparse exact text fallbacks"
     elif table_name == "spectrum_extra_params":
@@ -699,7 +704,7 @@ def registry_entry(conn, table_name, indexed_by_table):
         "row_count": row_count,
         "peak_count": peak_count,
         "indexed_columns": indexed_columns,
-        "derived": rel_type == "VIEW",
+        "derived": False,
         "included": True,
     }
 

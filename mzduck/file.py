@@ -19,6 +19,7 @@ from .reconstruction import (
 from .schema import (
     msn_levels_present,
     msn_table_name,
+    schema_version,
     table_exists,
     validate_required_schema,
 )
@@ -111,7 +112,7 @@ class MzDuckFile:
         meta = self.metadata()
         is_v2_ms2 = v2_ms2_storage(self.conn)
         if is_v2_ms2:
-            result = self._fetch_one("ms2_spectra", scan_number)
+            result = self._get_ms2_spectrum_v2(scan_number)
             if result is not None:
                 return finalize_spectrum(
                     result,
@@ -120,7 +121,7 @@ class MzDuckFile:
                     extra_params=self._extra_params(scan_number),
                 )
 
-        if table_exists(self.conn, "mgf") and not is_v2_ms2:
+        if table_exists(self.conn, "mgf"):
             result = self._get_ms2_spectrum_v1(scan_number)
             if result is not None:
                 return finalize_spectrum(
@@ -152,17 +153,98 @@ class MzDuckFile:
 
         raise KeyError(f"No spectrum with scan_number={scan_number}")
 
+    def _get_ms2_spectrum_v2(self, scan_number):
+        cursor = self.conn.execute(
+            """
+            SELECT
+                m.scan_number,
+                m.source_index,
+                d.instrument_configuration_ref,
+                CAST(NULL AS VARCHAR) AS native_id,
+                2 AS ms_level,
+                m.rt,
+                m.precursor_mz,
+                m.precursor_charge,
+                m.precursor_intensity,
+                d.collision_energy,
+                d.activation_type,
+                d.isolation_window_target,
+                d.isolation_window_lower,
+                d.isolation_window_upper,
+                CAST(NULL AS VARCHAR) AS spectrum_ref,
+                d.precursor_scan_number,
+                d.base_peak_mz,
+                d.base_peak_intensity,
+                d.tic,
+                d.lowest_mz,
+                d.highest_mz,
+                CAST(NULL AS VARCHAR) AS filter_string,
+                d.ion_injection_time,
+                d.monoisotopic_mz,
+                d.scan_window_lower,
+                d.scan_window_upper,
+                m.mz_array,
+                m.intensity_array
+            FROM mgf m
+            LEFT JOIN ms2_spectra d USING (scan_number)
+            WHERE m.scan_number = ?
+            """,
+            [scan_number],
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        columns = [item[0] for item in cursor.description]
+        return dict(zip(columns, row))
+
     def _get_ms2_spectrum_v1(self, scan_number):
-        if table_exists(self.conn, "ms2_spectra"):
+        if schema_version(self.conn) == "2":
+            cursor = self.conn.execute(
+                """
+                SELECT
+                    scan_number,
+                    source_index,
+                    CAST(NULL AS VARCHAR) AS instrument_configuration_ref,
+                    CAST(NULL AS VARCHAR) AS native_id,
+                    2 AS ms_level,
+                    rt,
+                    precursor_mz,
+                    precursor_charge,
+                    precursor_intensity,
+                    CAST(NULL AS FLOAT) AS collision_energy,
+                    CAST(NULL AS VARCHAR) AS activation_type,
+                    CAST(NULL AS DOUBLE) AS isolation_window_target,
+                    CAST(NULL AS FLOAT) AS isolation_window_lower,
+                    CAST(NULL AS FLOAT) AS isolation_window_upper,
+                    CAST(NULL AS VARCHAR) AS spectrum_ref,
+                    CAST(NULL AS INTEGER) AS precursor_scan_number,
+                    CAST(NULL AS FLOAT) AS base_peak_mz,
+                    CAST(NULL AS FLOAT) AS base_peak_intensity,
+                    CAST(NULL AS FLOAT) AS tic,
+                    CAST(NULL AS FLOAT) AS lowest_mz,
+                    CAST(NULL AS FLOAT) AS highest_mz,
+                    CAST(NULL AS VARCHAR) AS filter_string,
+                    CAST(NULL AS FLOAT) AS ion_injection_time,
+                    CAST(NULL AS DOUBLE) AS monoisotopic_mz,
+                    CAST(NULL AS FLOAT) AS scan_window_lower,
+                    CAST(NULL AS FLOAT) AS scan_window_upper,
+                    mz_array,
+                    intensity_array
+                FROM mgf
+                WHERE scan_number = ?
+                """,
+                [scan_number],
+            )
+        elif table_exists(self.conn, "ms2_spectra"):
             cursor = self.conn.execute(
                 """
                 SELECT
                     m.scan_number,
-                    m.title,
+                    CAST(NULL AS INTEGER) AS source_index,
+                    CAST(NULL AS VARCHAR) AS instrument_configuration_ref,
+                    d.native_id,
                     2 AS ms_level,
                     COALESCE(d.rt, m.rt) AS rt,
-                    d.source_index,
-                    d.native_id,
                     m.precursor_mz,
                     m.precursor_charge,
                     m.precursor_intensity,
@@ -196,11 +278,11 @@ class MzDuckFile:
                 """
                 SELECT
                     scan_number,
-                    title,
+                    CAST(NULL AS INTEGER) AS source_index,
+                    CAST(NULL AS VARCHAR) AS instrument_configuration_ref,
+                    CAST(NULL AS VARCHAR) AS native_id,
                     2 AS ms_level,
                     rt,
-                    CAST(NULL AS INTEGER) AS source_index,
-                    CAST(NULL AS VARCHAR) AS native_id,
                     precursor_mz,
                     precursor_charge,
                     precursor_intensity,
@@ -330,8 +412,11 @@ class MzDuckFile:
         return {
             "schema_version": meta.get("schema_version"),
             "source_filename": meta.get("source_filename"),
+            "source_compression": meta.get("source_compression"),
             "run_id": meta.get("run_id"),
             "import_mode": meta.get("import_mode"),
+            "container_format": meta.get("container_format"),
+            "compaction_method": meta.get("compaction_method"),
             "total_spectrum_count": int(meta.get("total_spectrum_count") or 0),
             "total_peak_count": int(meta.get("total_peak_count") or 0),
             "spectrum_count": int(meta.get("spectrum_count") or 0),
@@ -370,9 +455,7 @@ class MzDuckFile:
         selects = []
         if table_exists(self.conn, "ms1_spectra"):
             selects.append("SELECT scan_number, rt FROM ms1_spectra")
-        if v2_ms2_storage(self.conn):
-            selects.append("SELECT scan_number, rt FROM ms2_spectra")
-        elif table_exists(self.conn, "mgf"):
+        if table_exists(self.conn, "mgf"):
             selects.append("SELECT scan_number, rt FROM mgf")
         for level in msn_levels_present(self.conn):
             selects.append(f"SELECT scan_number, rt FROM {msn_table_name(level)}")

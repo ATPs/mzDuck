@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import gzip
+import shutil
+
 import numpy as np
 import pytest
 
@@ -150,6 +153,14 @@ def tiny_mzduck(tmp_path, tiny_mzml):
         compute_sha256=False,
     )
     handle.close()
+    return path
+
+
+@pytest.fixture
+def tiny_mzml_gz(tmp_path, tiny_mzml):
+    path = tmp_path / "tiny.mzML.gz"
+    with tiny_mzml.open("rb") as source, gzip.open(path, "wb") as target:
+        shutil.copyfileobj(source, target)
     return path
 
 

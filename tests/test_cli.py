@@ -15,8 +15,22 @@ def test_cli_help_includes_examples_and_precision_flags(capsys):
     captured = capsys.readouterr()
     assert "Examples:" in captured.out
     assert "mzduck convert input.mzML -o output.mzduck" in captured.out
+    assert "input.mzML.gz" in captured.out
+    assert "--parquet" in captured.out
+    assert "physical `mgf`" in captured.out
     assert "--mz64" in captured.out
     assert "--inten32" in captured.out
+
+
+def test_convert_help_mentions_parquet_and_mode_split(capsys):
+    with pytest.raises(SystemExit) as exc:
+        main(["convert", "--help"])
+
+    assert exc.value.code == 0
+    captured = capsys.readouterr()
+    assert "--parquet" in captured.out
+    assert "--parquet-zip" in captured.out
+    assert "run_metadata plus physical mgf only" in captured.out
 
 
 def test_cli_convert_inspect_and_export_mgf(tiny_mzml, tmp_path, capsys):

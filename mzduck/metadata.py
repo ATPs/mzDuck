@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import gzip
 import html
 import json
 import os
@@ -32,6 +33,19 @@ def source_sha256(path: str | os.PathLike[str], chunk_size: int = 1024 * 1024) -
         for chunk in iter(lambda: handle.read(chunk_size), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def source_compression_for_path(path: str | os.PathLike[str]) -> str:
+    text = str(path).lower()
+    if text.endswith(".mzml.gz"):
+        return "gzip"
+    return "none"
+
+
+def open_mzml_binary(path: str | os.PathLike[str]):
+    if source_compression_for_path(path) == "gzip":
+        return gzip.open(path, "rb")
+    return Path(path).open("rb")
 
 
 def to_jsonable(value: Any) -> Any:
@@ -154,7 +168,7 @@ def read_mzml_header_prefix(
 ) -> bytes:
     """Read bytes before ``spectrumList`` without parsing the whole mzML file."""
     data = bytearray()
-    with Path(path).open("rb") as handle:
+    with open_mzml_binary(path) as handle:
         while True:
             chunk = handle.read(chunk_size)
             if not chunk:
@@ -177,7 +191,7 @@ def read_mzml_prefix_through_spectrum_list(
 ) -> bytes:
     """Read bytes through the opening ``spectrumList`` tag."""
     data = bytearray()
-    with Path(path).open("rb") as handle:
+    with open_mzml_binary(path) as handle:
         while True:
             chunk = handle.read(chunk_size)
             if not chunk:
@@ -284,5 +298,6 @@ def provenance_metadata(
         "source_size_bytes": str(stat.st_size),
         "source_sha256": source_sha256(path) if compute_sha256 else "",
         "source_format": "mzML",
+        "source_compression": source_compression_for_path(path),
     }
     return metadata

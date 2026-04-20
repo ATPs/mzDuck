@@ -202,10 +202,10 @@ def export_spectrum_count(conn):
     count = 0
     if table_exists(conn, "ms1_spectra"):
         count += conn.execute("SELECT COUNT(*) FROM ms1_spectra").fetchone()[0]
-    if v2_ms2_storage(conn):
-        count += conn.execute("SELECT COUNT(*) FROM ms2_spectra").fetchone()[0]
-    elif table_exists(conn, "mgf"):
+    if table_exists(conn, "mgf"):
         count += conn.execute("SELECT COUNT(*) FROM mgf").fetchone()[0]
+    elif table_exists(conn, "ms2_spectra"):
+        count += conn.execute("SELECT COUNT(*) FROM ms2_spectra").fetchone()[0]
     for level in msn_levels_present(conn):
         count += conn.execute(
             f"SELECT COUNT(*) FROM {msn_table_name(level)}"
@@ -219,12 +219,12 @@ def file_description_params(conn):
         "SELECT COUNT(*) FROM ms1_spectra"
     ).fetchone()[0]:
         params.append("MS1 spectrum")
-    if v2_ms2_storage(conn) and conn.execute(
-        "SELECT COUNT(*) FROM ms2_spectra"
+    if table_exists(conn, "mgf") and conn.execute(
+        "SELECT COUNT(*) FROM mgf"
     ).fetchone()[0]:
         params.append("MSn spectrum")
-    elif table_exists(conn, "mgf") and conn.execute(
-        "SELECT COUNT(*) FROM mgf"
+    elif table_exists(conn, "ms2_spectra") and conn.execute(
+        "SELECT COUNT(*) FROM ms2_spectra"
     ).fetchone()[0]:
         params.append("MSn spectrum")
     for level in msn_levels_present(conn):
@@ -280,51 +280,52 @@ def iter_export_spectra(conn, *, metadata, text_overrides, extra_params):
     if v2_ms2_storage(conn):
         ms2_columns = set(get_table_columns(conn, "ms2_spectra"))
         instrument_config_expr = (
-            "instrument_configuration_ref"
+            "d.instrument_configuration_ref"
             if "instrument_configuration_ref" in ms2_columns
             else "CAST(NULL AS VARCHAR) AS instrument_configuration_ref"
         )
         selects.append(
             f"""
             SELECT
-                scan_number,
-                source_index,
+                m.scan_number,
+                m.source_index,
                 {instrument_config_expr},
                 CAST(NULL AS VARCHAR) AS native_id,
-                ms_level,
-                rt,
-                precursor_mz,
-                precursor_charge,
-                precursor_intensity,
-                collision_energy,
-                activation_type,
-                isolation_window_target,
-                isolation_window_lower,
-                isolation_window_upper,
+                2 AS ms_level,
+                m.rt,
+                m.precursor_mz,
+                m.precursor_charge,
+                m.precursor_intensity,
+                d.collision_energy,
+                d.activation_type,
+                d.isolation_window_target,
+                d.isolation_window_lower,
+                d.isolation_window_upper,
                 CAST(NULL AS VARCHAR) AS spectrum_ref,
-                precursor_scan_number,
-                base_peak_mz,
-                base_peak_intensity,
-                tic,
-                lowest_mz,
-                highest_mz,
+                d.precursor_scan_number,
+                d.base_peak_mz,
+                d.base_peak_intensity,
+                d.tic,
+                d.lowest_mz,
+                d.highest_mz,
                 CAST(NULL AS VARCHAR) AS filter_string,
-                ion_injection_time,
-                monoisotopic_mz,
-                scan_window_lower,
-                scan_window_upper,
-                mz_array,
-                intensity_array
-            FROM ms2_spectra
+                d.ion_injection_time,
+                d.monoisotopic_mz,
+                d.scan_window_lower,
+                d.scan_window_upper,
+                m.mz_array,
+                m.intensity_array
+            FROM mgf m
+            LEFT JOIN ms2_spectra d USING (scan_number)
             """
         )
     elif table_exists(conn, "mgf"):
-        if table_exists(conn, "ms2_spectra"):
+        if table_exists(conn, "ms2_spectra") and schema_version(conn) == "1":
             selects.append(
                 """
                 SELECT
                     m.scan_number,
-                    d.source_index,
+                    CAST(NULL AS INTEGER) AS source_index,
                     CAST(NULL AS VARCHAR) AS instrument_configuration_ref,
                     d.native_id,
                     2 AS ms_level,
@@ -360,7 +361,7 @@ def iter_export_spectra(conn, *, metadata, text_overrides, extra_params):
                 """
                 SELECT
                     scan_number,
-                    CAST(NULL AS INTEGER) AS source_index,
+                    source_index,
                     CAST(NULL AS VARCHAR) AS instrument_configuration_ref,
                     CAST(NULL AS VARCHAR) AS native_id,
                     2 AS ms_level,
@@ -740,7 +741,7 @@ def v2_ms2_storage(conn):
         return False
     if schema_version(conn) != "2":
         return False
-    return "mz_array" in set(get_table_columns(conn, "ms2_spectra"))
+    return True
 
 
 def restore_original_header_fragments(path, metadata, *, instrument_configuration_refs=None):
