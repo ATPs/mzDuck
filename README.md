@@ -36,6 +36,7 @@ The storage model is now built around a physical `mgf` payload table for MS2, an
 - empty optional tables are dropped before the final `.mzduck` file is written.
 - `.mzML.gz` is supported end-to-end.
 - `mzduck convert` can now write DuckDB, parquet folders, or parquet zip archives.
+- `mzduck mzml-mgf` can write one self-describing single-file MGF parquet.
 
 ## Mode behavior
 
@@ -153,6 +154,16 @@ This is the primary container.
 - each member stays a plain parquet file
 - empty optional relations are omitted here too
 
+### `mzml-mgf`
+
+`mzduck mzml-mgf` writes one self-describing parquet file for MS2 MGF export.
+
+- output is a single file, not a parquet container
+- it keeps the MGF payload columns and adds `title`, `rt_unit`, and `rt_seconds`
+- `title` stores only the file-name title source, not the full per-spectrum TITLE
+- recommended output naming is `*.mgf.parquet`
+- `mzduck convert --parquet` still exports physical relations as-is
+
 ## Reference size targets
 
 Reference benchmarking during development used representative PRIDE data,
@@ -231,6 +242,12 @@ Focused conversion help:
 python -m mzduck convert --help
 ```
 
+Focused MGF parquet help:
+
+```bash
+python -m mzduck mzml-mgf --help
+```
+
 ### Common conversions
 
 DuckDB:
@@ -281,6 +298,15 @@ python -m mzduck convert \
   --overwrite
 ```
 
+Single-file MGF parquet:
+
+```bash
+python -m mzduck mzml-mgf \
+  input.mzML.gz \
+  -o output.mgf.parquet \
+  --overwrite
+```
+
 Inspect:
 
 ```bash
@@ -291,7 +317,12 @@ Export MGF:
 
 ```bash
 python -m mzduck export-mgf output.mzduck -o output.mgf --overwrite
+python -m mzduck export-mgf output.mgf.parquet -o output.mgf --overwrite
 ```
+
+For self-describing `*.mgf.parquet` input, `export-mgf` reconstructs the full
+per-spectrum `TITLE` from the stored `title` source plus `scan_number` and
+charge.
 
 Export mzML:
 

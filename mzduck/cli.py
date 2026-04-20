@@ -5,9 +5,11 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 
+from .export_mgf import export_mgf_parquet
 from .file import MzDuckFile
-from .import_mzml import convert_mzml_to_parquet
+from .import_mzml import convert_mzml_to_mgf_parquet, convert_mzml_to_parquet
 
 
 class HelpFormatter(argparse.RawDescriptionHelpFormatter, argparse.ArgumentDefaultsHelpFormatter):
@@ -18,7 +20,8 @@ MAIN_DESCRIPTION = """\
 mzDuck stores centroid mzML spectra in a compact relational container.
 
 The default container is DuckDB-backed `.mzduck`, but `mzduck convert` can also
-write physical tables as Parquet files in a folder or in an uncompressed zip.
+write physical tables as Parquet files in a folder or in an uncompressed zip,
+and `mzduck mzml-mgf` can write one self-describing single-file MGF parquet.
 The v2 layout stores MS2 payload in a physical `mgf` table, keeps richer mzML
 detail in `ms2_spectra` when requested, stores sparse exact fallbacks only when
 reconstruction is not exact, and writes DuckDB output through a fresh-file
@@ -80,6 +83,7 @@ Examples:
   mzduck convert input.withMS1.mzML -o ms1-only.mzduck --ms1-only
   mzduck convert input.withMS1.mzML -o ms2-only.mzduck --ms2-only
   mzduck convert mzduck/example_data/tiny.mzML -o /tmp/tiny.mzduck --batch-size 1 --no-sha256
+  mzduck mzml-mgf input.mzML.gz -o output.mgf.parquet --overwrite
   mzduck inspect /tmp/tiny.mzduck --json
   mzduck export-mgf /tmp/tiny.mzduck -o /tmp/tiny.mgf --overwrite
   mzduck export-mzml /tmp/tiny.mzduck -o /tmp/tiny.mzML --mz64 --inten32 --overwrite
@@ -107,6 +111,10 @@ Defaults:
   --ms2-mgf-only keeps only `run_metadata` and physical `mgf`.
   --index-scan creates `idx_mgf_scan_number` on `mgf(scan_number)` so exact
   scan lookups stay fast.
+  mzml-mgf writes a single self-describing parquet file that includes the MGF
+  payload plus derived `title`, `rt_unit`, and `rt_seconds`. In that parquet,
+  `title` stores the file-name title source, and export-mgf reconstructs the
+  full per-spectrum TITLE from title + scan_number + charge.
   mzDuck stores peak arrays in the source dtype where possible.
   mzML export defaults to the stored/source dtype unless precision flags are used.
 """
@@ -225,25 +233,88 @@ Container modes:
         help="inclusive upper scan_number bound",
     )
 
-    export_mgf = subparsers.add_parser(
-        "export-mgf",
-        help="export mzDuck to MGF",
+    mzml_mgf = subparsers.add_parser(
+        "mzml-mgf",
+        help="convert mzML to a single self-describing MGF parquet file",
         formatter_class=HelpFormatter,
         description=(
-            "Export spectra from a .mzduck file to Mascot Generic Format using "
-            "the physical mgf table."
+            "Convert one centroid mzML or mzML.gz file into one self-describing "
+            "MGF parquet file."
+        ),
+        epilog="""\
+Examples:
+  mzduck mzml-mgf input.mzML -o output.mgf.parquet --overwrite
+  mzduck mzml-mgf input.mzML.gz -o output.mgf.parquet --overwrite
+  mzduck mzml-mgf input.withMS1.mzML -o window.mgf.parquet --start-scan 1000 --end-scan 2000
+
+Notes:
+  This command writes one parquet file, not a parquet container. The output
+  includes the physical MGF payload columns plus derived `title`, `rt_unit`,
+  and `rt_seconds`. The `title` column stores the file-name title source only;
+  export-mgf reconstructs the full per-spectrum TITLE from title,
+  scan_number, and charge, so no separate run_metadata file is needed.
+  `mzduck convert --parquet` still writes physical relations as-is.
+""",
+    )
+    mzml_mgf.add_argument("input_mzml", metavar="input.mzML[.gz]")
+    mzml_mgf.add_argument("output_mgf_parquet", nargs="?", metavar="output.mgf.parquet")
+    mzml_mgf.add_argument("-o", "--out", dest="out", metavar="output.mgf.parquet")
+    mzml_mgf.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="replace an existing output file",
+    )
+    mzml_mgf.add_argument(
+        "--batch-size",
+        type=int,
+        default=5000,
+        help="number of spectra per insert batch",
+    )
+    mzml_mgf.add_argument(
+        "--compression",
+        choices=["zstd", "auto", "uncompressed"],
+        default="zstd",
+        help="compression policy for the output parquet file",
+    )
+    mzml_mgf.add_argument(
+        "--compression-level",
+        type=int,
+        default=6,
+        help="requested zstd compression level when zstd is used",
+    )
+    mzml_mgf.add_argument(
+        "--start-scan",
+        type=int,
+        help="inclusive lower scan_number bound",
+    )
+    mzml_mgf.add_argument(
+        "--end-scan",
+        type=int,
+        help="inclusive upper scan_number bound",
+    )
+
+    export_mgf = subparsers.add_parser(
+        "export-mgf",
+        help="export mzDuck or self-describing MGF parquet to MGF",
+        formatter_class=HelpFormatter,
+        description=(
+            "Export spectra from a .mzduck file or self-describing .mgf.parquet "
+            "file to Mascot Generic Format."
         ),
         epilog="""\
 Examples:
   mzduck export-mgf input.mzduck -o output.mgf --overwrite
+  mzduck export-mgf input.mgf.parquet -o output.mgf --overwrite
   mzduck export-mgf mzduck/example_data/tiny.mzduck /tmp/tiny.mgf
 
 Notes:
-  In v2 the mgf relation is a stored base table.
-  TITLE values are always reconstructed from run metadata and scan_number/charge.
+  `.mzduck` input uses the stored physical mgf table and reconstructs TITLE
+  from run metadata plus scan_number/charge.
+  `.mgf.parquet` input is supported only for the self-describing parquet files
+  produced by `mzduck mzml-mgf`, where `title` stores only the title source.
 """,
     )
-    export_mgf.add_argument("input_mzduck", metavar="input.mzduck")
+    export_mgf.add_argument("input_source", metavar="input")
     export_mgf.add_argument("output_mgf", nargs="?", metavar="output.mgf")
     export_mgf.add_argument("-o", "--out", dest="out", metavar="output.mgf")
     export_mgf.add_argument("--overwrite", action="store_true", help="replace an existing output file")
@@ -395,10 +466,31 @@ def main(argv=None):
                 )
                 handle.close()
             return 0
+        if args.command == "mzml-mgf":
+            output = resolve_output(args, "output_mgf_parquet", parser)
+            convert_mzml_to_mgf_parquet(
+                args.input_mzml,
+                output,
+                overwrite=args.overwrite,
+                batch_size=args.batch_size,
+                compression=args.compression,
+                compression_level=args.compression_level,
+                start_scan=args.start_scan,
+                end_scan=args.end_scan,
+            )
+            return 0
         if args.command == "export-mgf":
             output = resolve_output(args, "output_mgf", parser)
-            with MzDuckFile.open(args.input_mzduck, read_only=True) as handle:
-                handle.to_mgf(output, overwrite=args.overwrite)
+            input_path = Path(args.input_source)
+            if input_path.name.lower().endswith(".parquet"):
+                export_mgf_parquet(
+                    input_path,
+                    output,
+                    overwrite=args.overwrite,
+                )
+            else:
+                with MzDuckFile.open(input_path, read_only=True) as handle:
+                    handle.to_mgf(output, overwrite=args.overwrite)
             return 0
         if args.command == "export-mzml":
             output = resolve_output(args, "output_mzml", parser)

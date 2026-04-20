@@ -134,6 +134,21 @@ These modes write the same physical relations as the DuckDB output for the
 selected mode, omit empty optional tables, and leave `MzDuckFile.open()`
 reserved for DuckDB `.mzduck` files.
 
+Single-file MGF parquet:
+
+```bash
+mzduck mzml-mgf input.mzML.gz -o /tmp/out.mgf.parquet --overwrite
+```
+
+This command is different from `mzduck convert --parquet`:
+
+- it writes one parquet file, not a parquet container
+- it keeps the MGF payload columns and adds derived `title`, `rt_unit`, and
+  `rt_seconds`
+- `title` stores only the file-name title source, not the full per-spectrum
+  TITLE
+- it is intended for standalone downstream MGF-style processing
+
 ## Reconstructed Fields
 
 `MzDuckFile.get_spectrum()`, `export-mgf`, and `export-mzml` reconstruct some
@@ -153,10 +168,13 @@ exception rows in `spectrum_text_overrides`.
 
 ```bash
 mzduck export-mgf /tmp/tiny.mzduck -o /tmp/tiny.mgf --overwrite
+mzduck export-mgf /tmp/out.mgf.parquet -o /tmp/from-parquet.mgf --overwrite
 ```
 
 The MGF output contains one `BEGIN IONS` block per MS2 spectrum. `TITLE` is
-always derived during export.
+always derived during export. For self-describing `*.mgf.parquet` input,
+`export-mgf` reconstructs the full per-spectrum `TITLE` from the stored
+`title` source plus `scan_number` and charge.
 
 ## Export mzDuck to mzML
 

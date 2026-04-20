@@ -15,6 +15,18 @@ def parquet_scalar(path, sql):
         conn.close()
 
 
+def parquet_columns(path):
+    conn = duckdb.connect()
+    try:
+        rows = conn.execute(
+            "DESCRIBE SELECT * FROM read_parquet(?)",
+            [str(path)],
+        ).fetchall()
+        return [row[0] for row in rows]
+    finally:
+        conn.close()
+
+
 def test_cli_convert_parquet_directory_omits_empty_tables(tiny_mzml, tmp_path):
     output = tmp_path / "tiny-parquet"
 
@@ -101,3 +113,108 @@ def test_parquet_keeps_non_empty_override_tables(tiny_raw_filter_mzml, tmp_path)
         output / "spectrum_text_overrides.parquet",
         "SELECT COUNT(*) FROM read_parquet('{path}') WHERE field_name = 'filter_string'",
     ) == 1
+
+
+def test_cli_mzml_mgf_writes_single_self_describing_parquet(tiny_mzml, tmp_path):
+    output = tmp_path / "tiny.mgf.parquet"
+
+    assert main(
+        [
+            "mzml-mgf",
+            str(tiny_mzml),
+            "-o",
+            str(output),
+            "--overwrite",
+            "--batch-size",
+            "1",
+        ]
+    ) == 0
+
+    assert output.exists()
+    assert parquet_columns(output) == [
+        "scan_number",
+        "source_index",
+        "rt",
+        "precursor_mz",
+        "precursor_intensity",
+        "precursor_charge",
+        "title",
+        "rt_unit",
+        "rt_seconds",
+        "mz_array",
+        "intensity_array",
+    ]
+    assert parquet_scalar(
+        output,
+        "SELECT COUNT(*) FROM read_parquet('{path}')",
+    ) == 2
+    assert parquet_scalar(
+        output,
+        "SELECT title FROM read_parquet('{path}') WHERE scan_number = 1",
+    ) == "tiny"
+    assert parquet_scalar(
+        output,
+        "SELECT title FROM read_parquet('{path}') WHERE scan_number = 2",
+    ) == "tiny"
+    assert parquet_scalar(
+        output,
+        "SELECT rt_unit FROM read_parquet('{path}') LIMIT 1",
+    ) == "minute"
+    assert parquet_scalar(
+        output,
+        "SELECT rt_seconds FROM read_parquet('{path}') WHERE scan_number = 1",
+    ) == 90.0
+
+
+def test_cli_mzml_mgf_supports_gzip_input_and_scan_windows(tiny_mzml_gz, tmp_path):
+    output = tmp_path / "window.mgf.parquet"
+
+    assert main(
+        [
+            "mzml-mgf",
+            str(tiny_mzml_gz),
+            "-o",
+            str(output),
+            "--overwrite",
+            "--start-scan",
+            "2",
+            "--end-scan",
+            "2",
+        ]
+    ) == 0
+
+    assert parquet_scalar(
+        output,
+        "SELECT COUNT(*) FROM read_parquet('{path}')",
+    ) == 1
+    assert parquet_scalar(
+        output,
+        "SELECT scan_number FROM read_parquet('{path}')",
+    ) == 2
+    assert parquet_scalar(
+        output,
+        "SELECT title FROM read_parquet('{path}')",
+    ) == "window"
+
+
+def test_cli_mzml_mgf_fails_when_selected_scans_have_no_ms2(
+    tiny_with_ms1_mzml, tmp_path, capsys
+):
+    output = tmp_path / "ms1-only.mgf.parquet"
+
+    assert main(
+        [
+            "mzml-mgf",
+            str(tiny_with_ms1_mzml),
+            "-o",
+            str(output),
+            "--start-scan",
+            "1",
+            "--end-scan",
+            "1",
+        ]
+    ) == 1
+
+    captured = capsys.readouterr()
+    assert "do not contain any MS2 spectra" in captured.err
+    assert not output.exists()

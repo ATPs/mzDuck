@@ -208,6 +208,17 @@ Default output is one `.mzduck` file.
 - writes the same parquet members into one zip archive
 - zip-level compression is disabled
 
+### Single-file MGF parquet
+
+`mzduck mzml-mgf`
+
+- writes one self-describing parquet file for MS2 MGF export
+- keeps the physical `mgf` payload columns
+- adds derived `title`, `rt_unit`, and `rt_seconds`
+- stores only the file-name title source in `title`
+- is CLI-only and is not opened by `MzDuckFile.open()`
+- remains distinct from `mzduck convert --parquet`, which exports physical relations as-is
+
 ## Reader/export behavior
 
 ### `MzDuckFile.get_spectrum()`
@@ -220,6 +231,8 @@ Default output is one `.mzduck` file.
 
 - reads physical `mgf`
 - derives `TITLE`
+- for self-describing `*.mgf.parquet`, reconstructs the full TITLE from the
+  stored title source plus `scan_number` and charge
 
 ### `export_mzml()`
 

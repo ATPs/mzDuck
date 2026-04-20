@@ -4,6 +4,7 @@ from lxml import etree
 from pyteomics import mgf, mzml
 
 from mzduck import MzDuckFile
+from mzduck.cli import main
 
 
 NS = {"mz": "http://psi.hupo.org/ms/mzml"}
@@ -47,6 +48,58 @@ def test_export_mgf(tiny_mzduck, tmp_path):
     spectra = list(mgf.read(str(output)))
     assert len(spectra) == 2
     assert int(spectra[0]["params"]["charge"][0]) == 2
+
+
+def test_export_mgf_from_self_describing_parquet(tiny_mzml, tmp_path):
+    parquet_path = tmp_path / "tiny.mgf.parquet"
+    output = tmp_path / "tiny-from-parquet.mgf"
+
+    assert main(
+        [
+            "mzml-mgf",
+            str(tiny_mzml),
+            "-o",
+            str(parquet_path),
+            "--overwrite",
+            "--batch-size",
+            "1",
+        ]
+    ) == 0
+    assert main(["export-mgf", str(parquet_path), str(output)]) == 0
+
+    text = output.read_text()
+    assert "TITLE=tiny.1.1.2" in text
+    assert "TITLE=tiny.2.2.3" in text
+    assert "PEPMASS=445.34 1200" in text
+    assert "CHARGE=2+" in text
+    assert "RTINSECONDS=90" in text
+    spectra = list(mgf.read(str(output)))
+    assert len(spectra) == 2
+    assert int(spectra[0]["params"]["charge"][0]) == 2
+
+
+def test_export_mgf_rejects_physical_parquet_member(tiny_mzml, tmp_path, capsys):
+    parquet_dir = tmp_path / "tiny-parquet"
+    output = tmp_path / "should-not-exist.mgf"
+
+    assert main(
+        [
+            "convert",
+            str(tiny_mzml),
+            "-o",
+            str(parquet_dir),
+            "--parquet",
+            "--overwrite",
+            "--batch-size",
+            "1",
+            "--no-sha256",
+        ]
+    ) == 0
+    assert main(["export-mgf", str(parquet_dir / "mgf.parquet"), str(output)]) == 1
+
+    captured = capsys.readouterr()
+    assert "self-describing mzduck mzml-mgf parquet output" in captured.err
+    assert not output.exists()
 
 
 def test_export_mzml_is_parseable(tiny_mzduck, tmp_path):

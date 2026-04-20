@@ -19,6 +19,7 @@ import pyarrow as pa
 from pyteomics import mzml
 
 from . import __version__
+from .export_mgf import rt_to_seconds
 from .metadata import (
     as_float,
     as_int,
@@ -566,6 +567,78 @@ def convert_mzml_to_parquet(
     return output
 
 
+def convert_mzml_to_mgf_parquet(
+    mzml_path,
+    output_path,
+    *,
+    overwrite=False,
+    batch_size=5000,
+    compression="zstd",
+    compression_level=6,
+    start_scan=None,
+    end_scan=None,
+):
+    source = Path(mzml_path)
+    output = Path(output_path)
+    validate_input_source(source)
+    validate_file_output_target(output, overwrite=overwrite)
+    if batch_size < 1:
+        raise ValueError("batch_size must be >= 1")
+    compression = validate_compression(compression)
+    compression_level = validate_compression_level(compression_level)
+    start_scan = coerce_optional_scan("start_scan", start_scan)
+    end_scan = coerce_optional_scan("end_scan", end_scan)
+    if start_scan is not None and end_scan is not None and start_scan > end_scan:
+        raise ValueError("--start-scan cannot be greater than --end-scan")
+
+    temp_db = output.with_name(f".{output.name}.mgf-source.{uuid.uuid4().hex}.mzduck")
+    temp_output = output.with_name(
+        f".{output.name}.mgf-staging.{uuid.uuid4().hex}.parquet"
+    )
+    try:
+        try:
+            convert_mzml_to_mzduck(
+                source,
+                temp_db,
+                overwrite=True,
+                batch_size=batch_size,
+                compression=compression,
+                compression_level=compression_level,
+                compute_sha256=False,
+                ms2_mgf_only=True,
+                start_scan=start_scan,
+                end_scan=end_scan,
+            )
+        except ValueError as exc:
+            if str(exc) == "No spectra matched the requested mzDuck import options":
+                raise ValueError(
+                    "Selected mzML spectra do not contain any MS2 spectra for mzml-mgf export"
+                ) from exc
+            raise
+        conn = duckdb.connect(str(temp_db), read_only=True)
+        try:
+            if not table_exists(conn, "mgf") or table_count(conn, "mgf") == 0:
+                raise ValueError(
+                    "Selected mzML spectra do not contain any MS2 spectra for mzml-mgf export"
+                )
+            metadata = dict(conn.execute("SELECT key, value FROM run_metadata").fetchall())
+            metadata["mgf_title_source"] = mgf_parquet_title_source(output)
+            copy_query_to_parquet(
+                conn,
+                mgf_parquet_projection_query(metadata),
+                temp_output,
+                compression=compression,
+                compression_level=compression_level,
+            )
+        finally:
+            conn.close()
+        os.replace(temp_output, output)
+    finally:
+        safe_remove_database_artifacts(temp_db)
+        safe_unlink(temp_output)
+    return output
+
+
 def validate_compacted_output(path: Path):
     conn = duckdb.connect(str(path), read_only=True)
     try:
@@ -689,6 +762,17 @@ def prepare_output_target(output: Path, *, overwrite: bool, expect_directory: bo
         output.mkdir(parents=False, exist_ok=False)
 
 
+def validate_file_output_target(output: Path, *, overwrite: bool):
+    if output.exists():
+        if output.is_dir():
+            raise FileExistsError(f"Output already exists and is a directory: {output}")
+        if not overwrite:
+            raise FileExistsError(f"Output already exists: {output}")
+    parent = output.parent or Path(".")
+    if not parent.exists():
+        raise FileNotFoundError(f"Output directory does not exist: {parent}")
+
+
 def export_duckdb_to_parquet_container(
     database_path: Path,
     output: Path,
@@ -766,11 +850,66 @@ def copy_relation_to_parquet(
     compression: str,
     compression_level: int,
 ):
+    copy_query_to_parquet(
+        conn,
+        f"SELECT * FROM {table_name}",
+        output_path,
+        compression=compression,
+        compression_level=compression_level,
+    )
+
+
+def copy_query_to_parquet(
+    conn,
+    query: str,
+    output_path: Path,
+    *,
+    compression: str,
+    compression_level: int,
+):
     sql = (
-        f"COPY {table_name} TO '{duckdb_sql_string(output_path)}' "
+        f"COPY ({query}) TO '{duckdb_sql_string(output_path)}' "
         f"({parquet_copy_options(compression, compression_level)})"
     )
     conn.execute(sql)
+
+
+def mgf_parquet_projection_query(metadata: dict[str, str]) -> str:
+    title_source = metadata.get("mgf_title_source") or "mzduck"
+    rt_unit = metadata.get("rt_unit") or ""
+    rt_seconds_expr = mgf_parquet_rt_seconds_expression(rt_unit)
+    return f"""
+        SELECT
+            scan_number,
+            source_index,
+            rt,
+            precursor_mz,
+            precursor_intensity,
+            precursor_charge,
+            '{duckdb_sql_string(title_source)}' AS title,
+            '{duckdb_sql_string(rt_unit)}' AS rt_unit,
+            {rt_seconds_expr} AS rt_seconds,
+            mz_array,
+            intensity_array
+        FROM mgf
+        ORDER BY scan_number
+    """
+
+
+def mgf_parquet_title_source(output: Path) -> str:
+    name = output.name
+    if name.lower().endswith(".mgf.parquet"):
+        source = name[: -len(".mgf.parquet")]
+        if source:
+            return source
+    return output.stem
+
+
+def mgf_parquet_rt_seconds_expression(rt_unit: str) -> str:
+    seconds_per_unit = rt_to_seconds(1.0, rt_unit)
+    if seconds_per_unit == 1.0:
+        return "CAST(rt AS DOUBLE)"
+    return f"CAST(rt AS DOUBLE) * {format(float(seconds_per_unit), '.15g')}"
 
 
 def parquet_copy_options(compression: str, compression_level: int):
