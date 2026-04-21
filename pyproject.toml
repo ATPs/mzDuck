@@ -22,6 +22,11 @@ dependencies = [
     "pyteomics",
 ]
 
+[project.optional-dependencies]
+numpress = [
+    "pynumpress",
+]
+
 [project.scripts]
 mzduck = "mzduck.cli:main"
 

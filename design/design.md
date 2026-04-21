@@ -177,6 +177,11 @@ Supported input files:
 - `.mzML`
 - `.mzML.gz`
 
+Runtime note:
+
+- ordinary mzML input does not need extra compression helpers
+- MS-Numpress-compressed mzML requires the optional `pynumpress` package to be installed and loadable in the active Python environment
+
 `run_metadata` records:
 
 - `source_format = mzML`

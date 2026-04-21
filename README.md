@@ -222,6 +222,17 @@ From this repository:
 python -m pip install -e .
 ```
 
+Optional MS-Numpress support:
+
+- `pynumpress` is not required for ordinary `.mzML` and `.mzML.gz` inputs.
+- If a source file stores binary arrays with MS-Numpress compression, install the optional extra before converting it with mzDuck.
+
+```bash
+python -m pip install -e .[numpress]
+```
+
+You can also install `pynumpress` directly into the active environment. If `pynumpress` is missing or cannot be loaded on the current machine, Numpress-compressed mzML files may fail to import until the dependency is available.
+
 Top-level imports remain stable:
 
 ```python
