@@ -116,6 +116,28 @@ SCALAR_ARROW_TYPES = {
 }
 
 MAX_ARRAY_VALUES_PER_BATCH = 250_000
+PRECURSOR_CHARGE_MIN = -(2**7)
+PRECURSOR_CHARGE_MAX = 2**7 - 1
+
+
+class SkipSpectrum(ValueError):
+    """Signal that one malformed spectrum should be skipped."""
+
+
+def emit_runtime_warning(message: str):
+    print(f"mzduck warning: {message}", file=sys.stderr, flush=True)
+
+
+def validated_precursor_charge(value, *, source, source_index, scan_number):
+    charge = as_int(value)
+    if charge is None:
+        return None
+    if PRECURSOR_CHARGE_MIN <= charge <= PRECURSOR_CHARGE_MAX:
+        return charge
+    raise SkipSpectrum(
+        f"{source}: skipping spectrum {source_index} (scan {scan_number}) because "
+        f"precursor charge {charge} is out of range"
+    )
 
 TOP_LEVEL_PARAM_SKIP = {
     "index",
@@ -311,18 +333,25 @@ def convert_mzml_to_mzduck(
                 if not include_spectrum(ms_level, scan_number, options):
                     continue
 
-                (
-                    record,
-                    mz_array,
-                    intensity_array,
-                    text_overrides,
-                    extra_params,
-                    row_warnings,
-                ) = spectrum_to_record(
-                    spectrum,
-                    source_index=source_index,
-                    constants=pre_scan,
-                )
+                try:
+                    (
+                        record,
+                        mz_array,
+                        intensity_array,
+                        text_overrides,
+                        extra_params,
+                        row_warnings,
+                    ) = spectrum_to_record(
+                        spectrum,
+                        source=source,
+                        source_index=source_index,
+                        constants=pre_scan,
+                    )
+                except SkipSpectrum as exc:
+                    message = str(exc)
+                    warnings.append(message)
+                    emit_runtime_warning(message)
+                    continue
                 warnings.extend(row_warnings)
                 inserted_counts[ms_level] += 1
                 inserted_peak_counts[ms_level] += len(mz_array)
@@ -1179,7 +1208,7 @@ def storage_type_for_dtypes(dtypes, label):
     )
 
 
-def spectrum_to_record(spectrum, *, source_index: int, constants: dict):
+def spectrum_to_record(spectrum, *, source, source_index: int, constants: dict):
     warnings: list[str] = []
     native_id = str(spectrum.get("id") or "")
     scan_number = resolve_scan_number(spectrum, native_id, source_index)
@@ -1233,6 +1262,12 @@ def spectrum_to_record(spectrum, *, source_index: int, constants: dict):
 
     isolation_target = as_float(isolation.get("isolation window target m/z"))
     selected_mz = as_float(selected_ion.get("selected ion m/z"))
+    precursor_charge = validated_precursor_charge(
+        selected_ion.get("charge state"),
+        source=source,
+        source_index=source_index,
+        scan_number=scan_number,
+    )
     activation_type = activation_type_from_dict(activation)
     if activation_type and activation_type not in set(ACTIVATION_MAP.values()):
         warnings.append(
@@ -1303,7 +1338,7 @@ def spectrum_to_record(spectrum, *, source_index: int, constants: dict):
         "ms_level": ms_level,
         "rt": rt,
         "precursor_mz": selected_mz if selected_mz is not None else isolation_target,
-        "precursor_charge": as_int(selected_ion.get("charge state")),
+        "precursor_charge": precursor_charge,
         "precursor_intensity": as_float(selected_ion.get("peak intensity")),
         "collision_energy": as_float(activation.get("collision energy")),
         "activation_type": activation_type,
@@ -1740,6 +1775,10 @@ def build_summary_metadata(
         "mgf_spectrum_count": str(table_count(conn, "mgf")),
         "mgf_peak_count": str(table_peak_count(conn, "mgf")),
         "table_registry": metadata_json(table_registry(conn)),
+        "included_ms_level_counts": metadata_json(dict(sorted(inserted_counts.items()))),
+        "included_ms_level_peak_counts": metadata_json(
+            dict(sorted(inserted_peak_counts.items()))
+        ),
         "conversion_warnings": json.dumps(warnings, sort_keys=True),
         "filter_string_encoding": filter_encoding,
     }

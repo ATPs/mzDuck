@@ -165,6 +165,17 @@ def tiny_mzml_gz(tmp_path, tiny_mzml):
 
 
 @pytest.fixture
+def tiny_invalid_charge_mzml(tmp_path, tiny_mzml):
+    path = tmp_path / "tiny-invalid-charge.mzML"
+    text = tiny_mzml.read_text(encoding="utf-8")
+    needle = 'name="charge state" value="2"/>'
+    replacement = 'name="charge state" value="1294941225"/>'
+    assert needle in text
+    path.write_text(text.replace(needle, replacement, 1), encoding="utf-8")
+    return path
+
+
+@pytest.fixture
 def tiny_with_ms1_mzml(tmp_path):
     from psims.mzml import MzMLWriter
 

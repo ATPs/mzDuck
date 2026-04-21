@@ -78,6 +78,33 @@ def test_export_mgf_from_self_describing_parquet(tiny_mzml, tmp_path):
     assert int(spectra[0]["params"]["charge"][0]) == 2
 
 
+def test_export_mgf_from_parquet_after_skipping_invalid_precursor_charge(
+    tiny_invalid_charge_mzml, tmp_path
+):
+    parquet_path = tmp_path / "tiny-invalid.mgf.parquet"
+    output = tmp_path / "tiny-invalid.mgf"
+
+    assert main(
+        [
+            "mzml-mgf",
+            str(tiny_invalid_charge_mzml),
+            "-o",
+            str(parquet_path),
+            "--overwrite",
+            "--batch-size",
+            "1",
+        ]
+    ) == 0
+    assert main(["export-mgf", str(parquet_path), str(output)]) == 0
+
+    text = output.read_text()
+    assert text.count("BEGIN IONS") == 1
+    assert text.count("CHARGE=") == 1
+    spectra = list(mgf.read(str(output)))
+    assert len(spectra) == 1
+    assert int(spectra[0]["params"]["charge"][0]) == 3
+
+
 def test_export_mgf_rejects_physical_parquet_member(tiny_mzml, tmp_path, capsys):
     parquet_dir = tmp_path / "tiny-parquet"
     output = tmp_path / "should-not-exist.mgf"

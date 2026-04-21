@@ -67,3 +67,10 @@ This is the single rolling key-change log for the repository. Append new dated s
 - consolidated the dated key-change entries in `design/key-changes/` into this single rolling file.
 - `AGENTS.md` now directs future key-change updates to append to `design/key-changes/key-changes.md`.
 - `design/design.md` now documents the single-file key-change workflow.
+
+## 2026-04-21 11:57 Asia/Shanghai
+
+- malformed precursor charges that do not fit mzDuck's signed `TINYINT` storage are now handled by skipping the affected spectrum instead of aborting conversion.
+- the importer prints a stderr warning for each skipped spectrum and records the warning in metadata.
+- included-count summary metadata now reflects spectra actually written after any skips.
+- regression tests now cover invalid precursor-charge input for `mzml-mgf` and `export-mgf`.

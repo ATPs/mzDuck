@@ -197,6 +197,36 @@ def test_cli_mzml_mgf_supports_gzip_input_and_scan_windows(tiny_mzml_gz, tmp_pat
     ) == "window"
 
 
+def test_cli_mzml_mgf_skips_invalid_precursor_charge(
+    tiny_invalid_charge_mzml, tmp_path, capsys
+):
+    output = tmp_path / "tiny-invalid.mgf.parquet"
+
+    assert main(
+        [
+            "mzml-mgf",
+            str(tiny_invalid_charge_mzml),
+            "-o",
+            str(output),
+            "--overwrite",
+            "--batch-size",
+            "1",
+        ]
+    ) == 0
+
+    captured = capsys.readouterr()
+    assert "skipping spectrum 0 (scan 1)" in captured.err
+    assert "precursor charge 1294941225 is out of range" in captured.err
+    assert parquet_scalar(
+        output,
+        "SELECT COUNT(*) FROM read_parquet('{path}')",
+    ) == 1
+    assert parquet_scalar(
+        output,
+        "SELECT scan_number FROM read_parquet('{path}')",
+    ) == 2
+
+
 def test_cli_mzml_mgf_fails_when_selected_scans_have_no_ms2(
     tiny_with_ms1_mzml, tmp_path, capsys
 ):

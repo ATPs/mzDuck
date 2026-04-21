@@ -240,6 +240,13 @@ Default output is one `.mzduck` file.
 - for self-describing `*.mgf.parquet`, reconstructs the full TITLE from the
   stored title source plus `scan_number` and charge
 
+### malformed precursor charge values
+
+- if a selected spectrum has a precursor charge outside the signed `TINYINT`
+  range used by mzDuck storage, mzDuck skips that spectrum during import
+- the converter prints a warning to stderr and records the warning in metadata
+- included-count metadata is based on the spectra that were actually written
+
 ### `export_mzml()`
 
 - uses `mgf` for arrays, RT, precursor payload, and source order
