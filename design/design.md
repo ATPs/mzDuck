@@ -221,6 +221,7 @@ Default output is one `.mzduck` file.
 - keeps the physical `mgf` payload columns
 - adds derived `title`, `rt_unit`, and `rt_seconds`
 - stores only the file-name title source in `title`
+- is intended to pair with `mzduck export-mgf input.mgf.parquet -o output.mgf`
 - is CLI-only and is not opened by `MzDuckFile.open()`
 - remains distinct from `mzduck convert --parquet`, which exports physical relations as-is
 
@@ -278,3 +279,8 @@ The current acceptance focus is:
 - no empty optional tables in final outputs
 - correct `.mzML.gz` handling
 - correct parquet/parquet-zip physical exports
+
+## Project note workflow
+
+- detailed work logs continue to use timestamped files in `design/develop-notes/`
+- key change summaries are now kept in the single rolling file `design/key-changes/key-changes.md`

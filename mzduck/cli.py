@@ -246,6 +246,7 @@ Examples:
   mzduck mzml-mgf input.mzML -o output.mgf.parquet --overwrite
   mzduck mzml-mgf input.mzML.gz -o output.mgf.parquet --overwrite
   mzduck mzml-mgf input.withMS1.mzML -o window.mgf.parquet --start-scan 1000 --end-scan 2000
+  mzduck export-mgf output.mgf.parquet -o output.mgf --overwrite
 
 Notes:
   This command writes one parquet file, not a parquet container. The output

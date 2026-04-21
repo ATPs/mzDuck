@@ -162,6 +162,7 @@ This is the primary container.
 - it keeps the MGF payload columns and adds `title`, `rt_unit`, and `rt_seconds`
 - `title` stores only the file-name title source, not the full per-spectrum TITLE
 - recommended output naming is `*.mgf.parquet`
+- the output can be converted later with `mzduck export-mgf output.mgf.parquet -o output.mgf --overwrite`
 - `mzduck convert --parquet` still exports physical relations as-is
 
 ## Reference size targets

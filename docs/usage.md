@@ -138,6 +138,7 @@ Single-file MGF parquet:
 
 ```bash
 mzduck mzml-mgf input.mzML.gz -o /tmp/out.mgf.parquet --overwrite
+mzduck export-mgf /tmp/out.mgf.parquet -o /tmp/out.mgf --overwrite
 ```
 
 This command is different from `mzduck convert --parquet`:
@@ -147,6 +148,7 @@ This command is different from `mzduck convert --parquet`:
   `rt_seconds`
 - `title` stores only the file-name title source, not the full per-spectrum
   TITLE
+- the output can be converted later with `export-mgf`
 - it is intended for standalone downstream MGF-style processing
 
 ## Reconstructed Fields

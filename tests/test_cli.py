@@ -43,6 +43,7 @@ def test_mzml_mgf_help_mentions_self_describing_output(capsys):
     assert "self-describing" in captured.out
     assert "rt_seconds" in captured.out
     assert "convert --parquet" in captured.out
+    assert "mzduck export-mgf output.mgf.parquet -o output.mgf --overwrite" in captured.out
 
 
 def test_export_mgf_help_mentions_parquet_input(capsys):
