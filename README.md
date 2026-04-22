@@ -1,362 +1,101 @@
 # mzDuck
 
-mzDuck stores centroid mzML runs in a compact relational container.
+mzDuck is a DuckDB-backed storage format, command-line tool, and Python package for centroid mzML data.
+It converts `.mzML` and `.mzML.gz` files into a compact relational container that is easy to query with SQL, easy to export to MGF, and able to round-trip back to semantic mzML.
 
-The current v2 design tries to keep two promises at the same time:
+The project is intentionally practical: a single-file primary container, a Python-first install story, direct DuckDB access, sparse exact metadata fallbacks, and export paths that match common downstream workflows.
 
-1. keep the final file close to mzMLb size in practice;
-2. keep enough structured information to export the important mzML content back faithfully.
+## Why mzDuck?
 
-The storage model is now built around a physical `mgf` payload table for MS2, an optional `ms2_spectra` detail table for richer mzML metadata, sparse exact fallback tables only when needed, and a compact-copy final write step for DuckDB output.
+- Single-file primary container: the default output is one DuckDB-backed `.mzduck` file.
+- Python package and CLI: install with `pip`, run `mzduck ...`, or `import mzduck` directly.
+- SQL-native workflow: open the file in DuckDB and query real tables such as `mgf` and `ms2_spectra`.
+- Focused scope: designed for centroid mzML conversion, inspection, export, and analysis.
+- Practical round-trip story: export MGF or semantic mzML from the same stored file.
+- Compact storage: v2 uses sparse exact text fallbacks, structure-aware metadata reconstruction, and a compact-copy final write step to keep files small.
 
-## Current v2 model
+## mzDuck vs mzPeak
 
-### Core relations
+`mzPeak` is a broader file-format prototyping project. It explores multiple Parquet layouts, profile-oriented encodings, chromatograms, and a Rust-first implementation. `mzDuck` takes a narrower path.
 
-- `run_metadata`
-  stores provenance, original header fragments, templates, encoder policy, counts, table registry, `container_format`, and `source_compression`.
-- `mgf`
-  physical MS2 payload table. This is the MGF-native contract: `scan_number`, `source_index`, RT, precursor payload, and peak arrays.
-- `ms2_spectra`
-  physical detail-only MS2 table keyed by `scan_number`. This stores richer mzML detail that is not part of the MGF-native payload.
-- `ms1_spectra`
-  physical MS1 table when MS1 is included.
-- `ms3_spectra`, `ms4_spectra`, ...
-  physical higher-order MSn tables when present.
-- `spectrum_text_overrides`
-  sparse exact text fallbacks for `native_id`, `spectrum_ref`, and `filter_string`.
-- `spectrum_extra_params`
-  unmapped mzML parameters that still need exact round-trip preservation.
+| If you care most about... | Why `mzDuck` is often the better fit |
+| --- | --- |
+| A simple end-user workflow | `mzDuck` is built around one direct task: convert centroid mzML into a compact, queryable file and export it again when needed. |
+| Python-first usage | `mzDuck` installs and imports as a normal Python package, with a small public API and a matching CLI. |
+| A single-file queryable container | The default output is one DuckDB file instead of an archive containing multiple member files. |
+| Straightforward SQL analysis | The MS2 payload lives in a physical `mgf` table, so common precursor/fragment workflows map cleanly to SQL. |
+| MGF-oriented downstream work | `mzDuck` has an explicit MGF-native contract, MGF export, and a single-file self-describing `*.mgf.parquet` mode. |
+| Centroid mzML fidelity with minimal duplication | Run-level templates plus sparse exact overrides avoid storing repetitive text fields row-by-row. |
+| Fewer user-facing encoding decisions | `mzDuck` hides most storage-layout complexity behind a small set of modes and defaults. |
 
-### What changed in this version
+Use `mzDuck` when you want a practical centroid mzML container for Python, SQL, and export workflows.
+Use `mzPeak` when you need the broader format R&D surface, profile/chromatogram work, or the Rust-centered ecosystem.
 
-- `mgf` is a real stored table again, not a compatibility view.
-- `ms2_spectra` no longer duplicates RT, precursor payload, or peak arrays.
-- `TITLE` is still derived, but it is not stored in `mgf`.
-- empty optional tables are dropped before the final `.mzduck` file is written.
-- `.mzML.gz` is supported end-to-end.
-- `mzduck convert` can now write DuckDB, parquet folders, or parquet zip archives.
-- `mzduck mzml-mgf` can write one self-describing single-file MGF parquet.
+## Current Scope
 
-## Mode behavior
+`mzDuck` currently targets:
 
-### Default
+- centroid `.mzML` and `.mzML.gz` input
+- one input run per command invocation
+- DuckDB-backed `.mzduck` as the primary container
+- optional Parquet directory and Parquet ZIP exports of physical relations
+- a single-file self-describing MGF Parquet export for MS2 workflows
+- MGF export and semantic mzML export
 
-Stores:
+Important scope notes:
 
-- `run_metadata`
-- `mgf`
-- `ms2_spectra`
-- `ms1_spectra` when present
-- `msN_spectra` when present
-- non-empty `spectrum_text_overrides`
-- non-empty `spectrum_extra_params`
-
-### `--ms2-only`
-
-Stores:
-
-- `run_metadata`
-- `mgf`
-- `ms2_spectra`
-- non-empty `spectrum_text_overrides`
-- non-empty `spectrum_extra_params`
-
-### `--ms2-mgf-only`
-
-Stores:
-
-- `run_metadata`
-- `mgf`
-
-This mode intentionally preserves the MGF-native contract only. It is smaller because it does not keep the richer mzML detail layer.
-
-### `--ms1-only`
-
-Stores:
-
-- `run_metadata`
-- `ms1_spectra`
-
-## Reconstructed vs stored fields
-
-### `TITLE`
-
-`TITLE` is always derived from:
-
-```text
-{mgf_title_source}.{scan_number}.{scan_number}.{precursor_charge}
-```
-
-It is available through the Python API and MGF export behavior, but not as a physical `mgf.title` column.
-
-### `native_id`
-
-If every selected spectrum matches one exact run-level template such as:
-
-```text
-controllerType=0 controllerNumber=1 scan={scan_number}
-```
-
-then mzDuck stores the template once in `run_metadata`.
-
-If not, mzDuck stores only the exact exception rows in `spectrum_text_overrides`.
-
-### `spectrum_ref`
-
-If every precursor reference matches one exact template such as:
-
-```text
-controllerType=0 controllerNumber=1 scan={precursor_scan_number}
-```
-
-then mzDuck stores that template in `run_metadata`.
-
-If not, mzDuck stores the original exact strings in `spectrum_text_overrides`.
-
-### `filter_string`
-
-Filter-string reconstruction is conservative and per-run.
-
-- mzDuck tests encoder candidates against the full selected run.
-- a candidate rule is accepted only if it reproduces every selected value exactly.
-- the accepted id is written to `run_metadata`, for example `thermo_ms2_v1`.
-- if no exact rule exists for that file, mzDuck sets `filter_string_encoding = raw` and stores the original strings.
-
-This avoids inventing approximate Thermo strings for files that do not fit the rule exactly.
-
-## Container formats
-
-### DuckDB `.mzduck`
-
-This is the primary container.
-
-- `MzDuckFile.open()` supports only this format.
-- `MzDuckFile.from_mzml()` and the top-level `from_mzml()` convenience API still write this format only.
-- writes use a staging file and a fresh final database compaction step.
-- mzDuck tries `COPY FROM DATABASE` first.
-- if DuckDB crashes on a large run during that step, mzDuck falls back to a fresh-process table copy into the final database.
-
-### `--parquet`
-
-`mzduck convert --parquet` writes one parquet file per physical relation into an output folder.
-
-- only physical relations are written
-- no derived compatibility views are written
-- empty optional relations are omitted
-- parquet compression reuses `--compression` and `--compression-level`
-
-### `--parquet-zip`
-
-`mzduck convert --parquet-zip` writes the same parquet members into one zip archive.
-
-- zip-level compression is disabled
-- each member stays a plain parquet file
-- empty optional relations are omitted here too
-
-### `mzml-mgf`
-
-`mzduck mzml-mgf` writes one self-describing parquet file for MS2 MGF export.
-
-- output is a single file, not a parquet container
-- it keeps the MGF payload columns and adds `title`, `rt_unit`, and `rt_seconds`
-- `title` stores only the file-name title source, not the full per-spectrum TITLE
-- recommended output naming is `*.mgf.parquet`
-- the output can be converted later with `mzduck export-mgf output.mgf.parquet -o output.mgf --overwrite`
-- `mzduck convert --parquet` still exports physical relations as-is
-
-## Reference size targets
-
-Reference benchmarking during development used representative PRIDE data,
-including public accession `PXD010154`.
-
-Baseline size references discussed during the redesign:
-
-| File | Size |
-| --- | ---: |
-| `1556259.mzML` | 409 MiB |
-| `1556259.mzMLb` | 84 MiB |
-| previous `1556259.mzduck` | 121 MiB |
-| previous `1556259.ms2-mgf-only.mzduck` | 136 MiB |
-
-The current v2 split is designed so that:
-
-- full/default output and `--ms2-mgf-only` are structurally different again
-- the full/default run can preserve the mzML detail layer
-- `--ms2-mgf-only` can stay smaller by keeping only the MGF-native payload
-
-### Observed validation snapshot
-
-The fixed `1556259` benchmark now lands at:
-
-| Artifact | Size |
-| --- | ---: |
-| `1556259.mzML` | 408.44 MiB |
-| `1556259.mzMLb` | 83.26 MiB |
-| previous `1556259.mzduck` | 120.01 MiB |
-| previous `1556259.ms2-mgf-only.mzduck` | 135.01 MiB |
-| `1556259.v2.mzduck` | 90.26 MiB |
-| `1556259.v2.ms2-mgf-only.mzduck` | 90.26 MiB |
-
-That means the current v2 default output is about 29.75 MiB smaller than the
-previous default file, the current v2 `--ms2-mgf-only` output is about 44.75
-MiB smaller than the previous `--ms2-mgf-only` file, and the v2 default output
-is within about 7 MiB of the matching mzMLb benchmark.
-
-Across the fixed 10-file `.mzML.gz` PRIDE validation set used during the April
-17 validation pass, default DuckDB output averaged 97.2% of the source gzip
-size, with an observed range of 89.9% to 102.3%.
-
-Sample compact-mode sizes from the same validation run:
-
-| Stem | Default | `--ms2-mgf-only` | `--parquet-zip` |
-| --- | ---: | ---: | ---: |
-| `708040` | 279.01 MiB | 144.26 MiB | 281.47 MiB |
-| `1802513` | 84.51 MiB | 8.26 MiB | 80.39 MiB |
-| `1861786` | 159.76 MiB | 68.76 MiB | 161.99 MiB |
+- exported mzML is intended to be semantically faithful, not byte-identical XML
+- `MzDuckFile.open()` supports DuckDB `.mzduck` files, not Parquet containers
+- `--ms2-mgf-only` preserves the MGF-native contract only, not the full mzML detail layer
 
 ## Installation
 
-From this repository:
+### Requirements
+
+- Python 3.10 or newer
+- standard runtime dependencies are installed automatically from `pyproject.toml`
+- `pynumpress` is only needed when importing mzML files whose binary arrays use MS-Numpress compression
+
+### Install from source
+
+```bash
+python -m pip install .
+```
+
+For development:
 
 ```bash
 python -m pip install -e .
 ```
 
-Optional MS-Numpress support:
-
-- `pynumpress` is not required for ordinary `.mzML` and `.mzML.gz` inputs.
-- If a source file stores binary arrays with MS-Numpress compression, install the optional extra before converting it with mzDuck.
+Optional Numpress support:
 
 ```bash
-python -m pip install -e .[numpress]
+python -m pip install ".[numpress]"
 ```
 
-You can also install `pynumpress` directly into the active environment. If `pynumpress` is missing or cannot be loaded on the current machine, Numpress-compressed mzML files may fail to import until the dependency is available.
-
-Top-level imports remain stable:
-
-```python
-from mzduck import MzDuckFile, from_mzml, open, to_mgf, to_mzml
-```
-
-## Command line
-
-Landing help:
+After installation, both of these should work:
 
 ```bash
+mzduck --help
 python -m mzduck --help
 ```
 
-Focused conversion help:
+## Python Package Usage
 
-```bash
-python -m mzduck convert --help
-```
-
-Focused MGF parquet help:
-
-```bash
-python -m mzduck mzml-mgf --help
-```
-
-### Common conversions
-
-DuckDB:
-
-```bash
-python -m mzduck convert \
-  input.mzML \
-  -o output.mzduck \
-  --overwrite
-```
-
-Gzipped mzML:
-
-```bash
-python -m mzduck convert \
-  input.mzML.gz \
-  -o output.mzduck \
-  --overwrite
-```
-
-MS2 MGF-only:
-
-```bash
-python -m mzduck convert \
-  input.mzML.gz \
-  -o output.ms2-mgf-only.mzduck \
-  --ms2-mgf-only \
-  --overwrite
-```
-
-Parquet folder:
-
-```bash
-python -m mzduck convert \
-  input.mzML.gz \
-  -o output.parquet.dir \
-  --parquet \
-  --overwrite
-```
-
-Parquet zip:
-
-```bash
-python -m mzduck convert \
-  input.mzML.gz \
-  -o output.parquet.zip \
-  --parquet-zip \
-  --overwrite
-```
-
-Single-file MGF parquet:
-
-```bash
-python -m mzduck mzml-mgf \
-  input.mzML.gz \
-  -o output.mgf.parquet \
-  --overwrite
-```
-
-Inspect:
-
-```bash
-python -m mzduck inspect output.mzduck --json
-```
-
-Export MGF:
-
-```bash
-python -m mzduck export-mgf output.mzduck -o output.mgf --overwrite
-python -m mzduck export-mgf output.mgf.parquet -o output.mgf --overwrite
-```
-
-For self-describing `*.mgf.parquet` input, `export-mgf` reconstructs the full
-per-spectrum `TITLE` from the stored `title` source plus `scan_number` and
-charge.
-
-Export mzML:
-
-```bash
-python -m mzduck export-mzml output.mzduck -o roundtrip.mzML --overwrite
-```
-
-Precision control for mzML export:
-
-```bash
-python -m mzduck export-mzml output.mzduck -o out.mzML --32 --overwrite
-python -m mzduck export-mzml output.mzduck -o out.mzML --mz64 --inten32 --overwrite
-```
-
-## Python usage
-
-Create a new `.mzduck` file:
+`mzDuck` can be used either as a CLI or as an importable Python package.
+The public top-level API is:
 
 ```python
-from mzduck import MzDuckFile
+from mzduck import MzDuckFile, example_data_path, from_mzml, open, to_mgf, to_mzml
+```
 
-db = MzDuckFile.from_mzml(
+### Convert and inspect from Python
+
+```python
+from mzduck import from_mzml
+
+handle = from_mzml(
     "input.mzML.gz",
     "output.mzduck",
     overwrite=True,
@@ -364,52 +103,302 @@ db = MzDuckFile.from_mzml(
 )
 
 try:
-    print(db.inspect())
-    spectrum = db.get_spectrum(2)
+    print(handle.inspect())
+    spectrum = handle.get_spectrum(1)
     print(spectrum["title"])
     print(spectrum["native_id"])
     print(spectrum["mz"])
     print(spectrum["intensity"])
 finally:
-    db.close()
+    handle.close()
 ```
 
-Open an existing file:
+### Open an existing file and run SQL
 
 ```python
 from mzduck import MzDuckFile
 
 with MzDuckFile.open("output.mzduck") as db:
     print(db.metadata()["schema_version"])
-    print(db.get_spectrum(1)["title"])
+
+    rows = db.query(
+        """
+        SELECT scan_number, rt, precursor_mz, precursor_charge
+        FROM mgf
+        WHERE precursor_mz BETWEEN ? AND ?
+        ORDER BY rt
+        """,
+        [440.0, 450.0],
+    ).fetchall()
+    print(rows)
 ```
 
-Top-level convenience functions:
+### Export from Python
 
 ```python
-from mzduck import from_mzml, to_mgf, to_mzml
+from mzduck import to_mgf, to_mzml
 
-from_mzml("input.mzML.gz", "output.mzduck", overwrite=True, compute_sha256=False)
 to_mgf("output.mzduck", "output.mgf")
-to_mzml("output.mzduck", "output.mzML")
+to_mzml("output.mzduck", "roundtrip.mzML")
 ```
 
-## SQL examples
+## Quick Start
 
-### MGF-native MS2 payload
+Convert one file to the default `.mzduck` container:
+
+```bash
+mzduck convert input.mzML.gz -o output.mzduck --overwrite
+```
+
+Inspect the result:
+
+```bash
+mzduck inspect output.mzduck --json
+```
+
+Export MGF:
+
+```bash
+mzduck export-mgf output.mzduck -o output.mgf --overwrite
+```
+
+Export semantic mzML:
+
+```bash
+mzduck export-mzml output.mzduck -o roundtrip.mzML --overwrite
+```
+
+Create a single-file MGF Parquet artifact:
+
+```bash
+mzduck mzml-mgf input.mzML.gz -o output.mgf.parquet --overwrite
+```
+
+## Command Overview
+
+`mzduck` provides five subcommands:
+
+- `convert`: convert one centroid mzML file into `.mzduck`, Parquet directory, or Parquet ZIP
+- `mzml-mgf`: convert one centroid mzML file into one self-describing `*.mgf.parquet`
+- `export-mgf`: export `.mzduck` or self-describing `*.mgf.parquet` to `.mgf`
+- `export-mzml`: export `.mzduck` back to semantic `.mzML`
+- `inspect`: print a summary of a `.mzduck` file
+
+## Command Reference
+
+### `mzduck convert`
+
+Convert one centroid `.mzML` or `.mzML.gz` file into a compact `.mzduck` file or a Parquet-based container.
+
+```bash
+mzduck convert input.mzML.gz -o output.mzduck --overwrite
+```
+
+Common examples:
+
+```bash
+mzduck convert input.mzML -o output.mzduck --overwrite
+mzduck convert input.mzML.gz -o output.mzduck --overwrite
+mzduck convert input.mzML.gz -o output.parquet.dir --parquet --overwrite
+mzduck convert input.mzML.gz -o output.parquet.zip --parquet-zip --overwrite
+mzduck convert input.mzML.gz -o output.ms2.mzduck --ms2-only --overwrite
+mzduck convert input.mzML.gz -o output.mgf-only.mzduck --ms2-mgf-only --overwrite
+mzduck convert input.withMS1.mzML -o output.ms1.mzduck --ms1-only --overwrite
+mzduck convert input.withMS1.mzML -o output.window.mzduck --start-scan 1000 --end-scan 2000 --overwrite
+```
+
+#### Parameters
+
+| Parameter | Meaning |
+| --- | --- |
+| `input.mzML[.gz]` | Input centroid mzML file. `.mzML` and `.mzML.gz` are supported. |
+| `output` | Positional output path. Use this or `-o/--out`. |
+| `-o, --out` | Named output path. Use this or the positional output path. |
+| `--overwrite` | Replace an existing output file or folder. |
+| `--batch-size` | Number of spectra inserted per batch. Larger values may improve throughput; smaller values may reduce peak memory. Default: `5000`. |
+| `--no-sha256` | Skip SHA-256 hashing of the source file in provenance metadata. |
+| `--compression {zstd,auto,uncompressed}` | Compression policy for DuckDB output and Parquet members. Default: `zstd`. |
+| `--compression-level` | Requested Zstandard compression level when `zstd` is used. Default: `6`. |
+| `--index-scan` | Create `idx_mgf_scan_number` on `mgf(scan_number)` for faster exact scan lookup. |
+| `--index-scan-number` | Deprecated alias for `--index-scan`. |
+| `--parquet` | Write one Parquet file per physical relation into an output directory instead of a `.mzduck` file. |
+| `--parquet-zip` | Write the same physical Parquet members into one ZIP archive with no ZIP-level compression. |
+| `--ms2-mgf-only` | Keep only `run_metadata` and the physical `mgf` table. This is the smallest MS2-focused mode. |
+| `--no-ms1` | Skip MS1 spectra in the default mode. |
+| `--ms2-only` | Keep `run_metadata`, `mgf`, `ms2_spectra`, and any non-empty fallback tables. |
+| `--ms1-only` | Keep only `run_metadata` and `ms1_spectra`. |
+| `--start-scan` | Inclusive lower `scan_number` bound for subsetting. |
+| `--end-scan` | Inclusive upper `scan_number` bound for subsetting. |
+
+#### Notes
+
+- Use either the positional output path or `-o/--out`, not both.
+- `--parquet` and `--parquet-zip` are mutually exclusive.
+- `--ms2-mgf-only`, `--ms2-only`, and `--ms1-only` are mutually exclusive.
+- `--no-ms1` cannot be combined with `--ms1-only`.
+- `--start-scan` cannot be greater than `--end-scan`.
+- In default mode, `mzDuck` keeps `run_metadata`, `mgf`, `ms2_spectra`, MS1 when present, higher MSn tables when present, and non-empty fallback tables.
+
+### `mzduck mzml-mgf`
+
+Convert one centroid `.mzML` or `.mzML.gz` file into one self-describing `*.mgf.parquet` file for MGF-style downstream processing.
+
+```bash
+mzduck mzml-mgf input.mzML.gz -o output.mgf.parquet --overwrite
+```
+
+#### Parameters
+
+| Parameter | Meaning |
+| --- | --- |
+| `input.mzML[.gz]` | Input centroid mzML file. |
+| `output.mgf.parquet` | Positional output path. Use this or `-o/--out`. |
+| `-o, --out` | Named output path. Use this or the positional output path. |
+| `--overwrite` | Replace an existing output file. |
+| `--batch-size` | Number of spectra inserted per batch. Default: `5000`. |
+| `--compression {zstd,auto,uncompressed}` | Compression policy for the Parquet file. Default: `zstd`. |
+| `--compression-level` | Requested Zstandard compression level when `zstd` is used. Default: `6`. |
+| `--start-scan` | Inclusive lower `scan_number` bound. |
+| `--end-scan` | Inclusive upper `scan_number` bound. |
+
+#### Notes
+
+- This command writes one Parquet file, not a Parquet container.
+- The output includes the MGF payload plus `title`, `rt_unit`, and `rt_seconds`.
+- The stored `title` column contains only the file-name title source; `export-mgf` reconstructs the full per-spectrum `TITLE` from `title + scan_number + charge`.
+
+### `mzduck export-mgf`
+
+Export spectra from `.mzduck` or self-describing `*.mgf.parquet` to Mascot Generic Format.
+
+```bash
+mzduck export-mgf input.mzduck -o output.mgf --overwrite
+mzduck export-mgf input.mgf.parquet -o output.mgf --overwrite
+```
+
+#### Parameters
+
+| Parameter | Meaning |
+| --- | --- |
+| `input` | Input `.mzduck` file or self-describing `*.mgf.parquet` file. |
+| `output.mgf` | Positional output path. Use this or `-o/--out`. |
+| `-o, --out` | Named output path. Use this or the positional output path. |
+| `--overwrite` | Replace an existing output file. |
+
+#### Notes
+
+- `.mzduck` export uses the physical `mgf` table and reconstructs `TITLE` from run metadata.
+- Parquet input is supported only for the self-describing `*.mgf.parquet` files produced by `mzduck mzml-mgf`.
+
+### `mzduck export-mzml`
+
+Export a `.mzduck` file back to semantic mzML using `psims`.
+
+```bash
+mzduck export-mzml input.mzduck -o output.mzML --overwrite
+```
+
+Precision examples:
+
+```bash
+mzduck export-mzml input.mzduck -o output.float32.mzML --32 --overwrite
+mzduck export-mzml input.mzduck -o output.float64.mzML --64 --overwrite
+mzduck export-mzml input.mzduck -o output.mz64-int32.mzML --mz64 --inten32 --overwrite
+mzduck export-mzml input.mzduck -o output.mz32-int64.mzML --mz32 --inten64 --overwrite
+```
+
+#### Parameters
+
+| Parameter | Meaning |
+| --- | --- |
+| `input.mzduck` | Input `.mzduck` file. |
+| `output.mzML` | Positional output path. Use this or `-o/--out`. |
+| `-o, --out` | Named output path. Use this or the positional output path. |
+| `--overwrite` | Replace an existing output file. |
+| `--32` | Write both m/z and intensity arrays as 32-bit floats. |
+| `--64` | Write both m/z and intensity arrays as 64-bit floats. |
+| `--mz32` | Write only m/z arrays as 32-bit floats. |
+| `--mz64` | Write only m/z arrays as 64-bit floats. |
+| `--inten32` | Write only intensity arrays as 32-bit floats. |
+| `--inten64` | Write only intensity arrays as 64-bit floats. |
+
+#### Notes
+
+- `--32` and `--64` cannot be used together.
+- `--mz32` and `--mz64` cannot be used together.
+- `--inten32` and `--inten64` cannot be used together.
+- By default, mzML export keeps the stored or source precision when possible.
+- The export is semantic rather than byte-identical XML.
+
+### `mzduck inspect`
+
+Print a summary of counts, ranges, storage metadata, reconstruction policy, and table registry details for a `.mzduck` file.
+
+```bash
+mzduck inspect input.mzduck
+mzduck inspect input.mzduck --json
+```
+
+#### Parameters
+
+| Parameter | Meaning |
+| --- | --- |
+| `input.mzduck` | Input `.mzduck` file to inspect. |
+| `--json` | Print machine-readable JSON instead of plain text. |
+
+## Storage Model
+
+The v2 layout is centered on a small number of physical relations:
+
+- `run_metadata`: provenance, templates, encoder policy, counts, table registry, `container_format`, and `source_compression`
+- `mgf`: the physical MS2 payload table with scan number, source order, RT, precursor payload, and peak arrays
+- `ms2_spectra`: a detail-only MS2 table keyed by `scan_number`
+- `ms1_spectra`: physical MS1 spectra when MS1 is included
+- `ms3_spectra`, `ms4_spectra`, ...: higher-order MSn tables when present
+- `spectrum_text_overrides`: sparse exact fallbacks for `native_id`, `spectrum_ref`, and `filter_string`
+- `spectrum_extra_params`: unmapped mzML parameters that still need exact preservation
+
+Important v2 behavior:
+
+- `mgf` is a real stored table, not a compatibility view
+- `ms2_spectra` no longer duplicates RT, precursor payload, or peak arrays
+- `TITLE` is derived, not stored as `mgf.title`
+- empty optional tables are dropped before the final `.mzduck` file is written
+
+## Reconstruction Model
+
+`mzDuck` tries to avoid storing repetitive text fields row-by-row when one exact run-level rule is enough.
+
+### `TITLE`
+
+`TITLE` is always derived as:
+
+```text
+{mgf_title_source}.{scan_number}.{scan_number}.{precursor_charge}
+```
+
+### `native_id` and `spectrum_ref`
+
+If all selected spectra match one exact run-level template, the template is stored once in `run_metadata`.
+If not, `mzDuck` stores only the exact exception rows in `spectrum_text_overrides`.
+
+### `filter_string`
+
+Filter-string reconstruction is conservative.
+An encoder is accepted only when it reproduces every selected value exactly for that run.
+If no exact rule exists, `mzDuck` stores the original strings instead of inventing an approximate rule.
+
+## SQL Examples
+
+### Inspect the MGF-native MS2 payload
 
 ```sql
-SELECT
-  scan_number,
-  source_index,
-  rt,
-  precursor_mz,
-  precursor_charge
+SELECT scan_number, source_index, rt, precursor_mz, precursor_charge
 FROM mgf
 ORDER BY source_index;
 ```
 
-### MS2 payload plus detail layer
+### Join MS2 payload with the detail layer
 
 ```sql
 SELECT
@@ -424,7 +413,7 @@ LEFT JOIN ms2_spectra AS d USING (scan_number)
 ORDER BY m.source_index;
 ```
 
-### Extract an ion chromatogram from stored arrays
+### Build a simple extracted ion chromatogram
 
 ```sql
 SELECT rt, SUM(p.intensity) AS xic
@@ -440,7 +429,7 @@ GROUP BY rt
 ORDER BY rt;
 ```
 
-### Find raw text fallbacks that had to be stored
+### Find stored exact text fallbacks
 
 ```sql
 SELECT scan_number, field_name, value
@@ -448,67 +437,26 @@ FROM spectrum_text_overrides
 ORDER BY scan_number, field_name;
 ```
 
-### Inspect unmapped mzML params
+## Size Notes
 
-```sql
-SELECT scan_number, scope, ordinal, name, value
-FROM spectrum_extra_params
-ORDER BY scan_number, scope, ordinal;
-```
+Internal validation during v2 development used representative public PRIDE data, including accession `PXD010154`.
+On one benchmark file, a `408.44 MiB` mzML converted to a `90.26 MiB` v2 `.mzduck`, compared with `83.26 MiB` for the matching `mzMLb` file.
+Across a fixed 10-file `.mzML.gz` validation set, default DuckDB output averaged `97.2%` of source gzip size, with an observed range of `89.9%` to `102.3%`.
 
-## Manual validation ideas
+## Examples and Additional Docs
 
-For larger validation runs, compare the same representative `.mzML.gz` inputs
-across:
+- [docs/usage.md](docs/usage.md): more usage examples
+- [examples/README.md](examples/README.md): example scripts
+- [mzduck/example_data/README.md](mzduck/example_data/README.md): bundled tiny example data
+- [design/design.md](design/design.md): design notes
 
-- default DuckDB output
-- `--ms2-mgf-only`
-- `--parquet`
-- `--parquet-zip`
+## Limitations
 
-Example commands:
+- current import support is intentionally focused on centroid mzML
+- the public API is centered on `.mzduck` as the primary container
+- Parquet container outputs expose physical relations only; they do not recreate DuckDB-only convenience behavior
+- `mzduck export-mzml` aims for semantic fidelity, not source XML identity
 
-```bash
-python -m mzduck convert \
-  input.mzML.gz \
-  -o output.default.mzduck \
-  --overwrite \
-  --no-sha256
+## License
 
-python -m mzduck convert \
-  input.mzML.gz \
-  -o output.ms2-mgf-only.mzduck \
-  --ms2-mgf-only \
-  --overwrite \
-  --no-sha256
-
-python -m mzduck convert \
-  input.mzML.gz \
-  -o output.parquet.dir \
-  --parquet \
-  --overwrite \
-  --no-sha256
-
-python -m mzduck convert \
-  input.mzML.gz \
-  -o output.parquet.zip \
-  --parquet-zip \
-  --overwrite \
-  --no-sha256
-```
-
-## Design notes
-
-The main design doc is:
-
-- `design/design.md`
-
-Supporting design snapshots:
-
-- `design/20260416design.codex.md`
-- `design/20260416design.claude.md`
-
-Development notes are recorded in:
-
-- `design/develop-notes/`
-- `design/key-changes/`
+`mzDuck` is distributed under the terms of the [LICENSE](LICENSE) file.
