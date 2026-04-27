@@ -74,3 +74,17 @@ This is the single rolling key-change log for the repository. Append new dated s
 - the importer prints a stderr warning for each skipped spectrum and records the warning in metadata.
 - included-count summary metadata now reflects spectra actually written after any skips.
 - regression tests now cover invalid precursor-charge input for `mzml-mgf` and `export-mgf`.
+
+## 2026-04-27 19:06 Asia/Shanghai
+
+- added a small ready-to-use sample dataset under `examples/data/`.
+- the new example set includes `tiny.mzML`, `tiny.mzduck`, `tiny.mgf`, `tiny.mzduck.mgf`, and `tiny.mgf.parquet`.
+- `tiny.mgf` was generated with `msconvert`, while `tiny.mzduck.mgf` and `tiny.mgf.parquet` were generated with mzDuck commands.
+- `examples/README.md` now describes the new example files and their origins.
+
+## 2026-04-27 19:12 Asia/Shanghai
+
+- replaced the temporary `tiny.*` example set under `examples/data/` with a larger `small.*` dataset derived from `/data/p/xiaolong/mzPeak/mzPeak/small.mzML`.
+- because the source file was profile data, `msconvert --filter "peakPicking true 1-"` is now used to create the centroid `examples/data/small.mzML` sample.
+- `examples/data/` now contains `small.mzML`, `small.mzduck`, `small.mgf`, `small.mzduck.mgf`, and `small.mgf.parquet`.
+- `examples/README.md` now documents the `small.*` example set and its approximate scale.
